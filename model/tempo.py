@@ -5,7 +5,6 @@
 #  - 4D reference grid for grid_sample (batch sizes match)
 #  - Vectorized scene-cut fallback
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

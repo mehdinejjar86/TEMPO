@@ -42,13 +42,13 @@ if __name__ == "__main__":
     print(f"[interp] ✓ Output: {out.shape}")
     print(f"[interp] ✓ Weights[0]: {aux['weights'][0].detach().cpu().numpy()}")
 
-    loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time)
+    loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
     loss.backward()
     gnorm = grad_norm(model)
     opt.step()
 
     print(f"[interp] loss={loss.item():.4f} grad_norm={gnorm:.3f}  "
-          f"charb={logs['rec/charb']:.4f} msssim={logs['rec/msssim']:.4f} perc={logs['rec/perc']:.4f}")
+      f"l1={logs.get('l1', 0):.4f} ssim={logs.get('ssim', 0):.4f} perc={logs.get('perceptual', 0):.4f}")
 
     # --------------------------
     # 2) Forward extrapolation (N=2): predict one step ahead
@@ -67,12 +67,12 @@ if __name__ == "__main__":
     print(f"[extra-fwd] ✓ Output: {out.shape}")
     print(f"[extra-fwd] ✓ Weights[0]: {aux['weights'][0].detach().cpu().numpy()}")
 
-    loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time)
+    loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
     loss.backward()
     gnorm = grad_norm(model)
     opt.step()
 
     print(f"[extra-fwd] loss={loss.item():.4f} grad_norm={gnorm:.3f}  "
-          f"charb={logs['rec/charb']:.4f} msssim={logs['rec/msssim']:.4f} perc={logs['rec/perc']:.4f}")
+      f"l1={logs.get('l1', 0):.4f} ssim={logs.get('ssim', 0):.4f} perc={logs.get('perceptual', 0):.4f}")
 
     print("All good ✅")
