@@ -215,7 +215,7 @@ class TimeAwareSlidingWindowPyramidAttention(nn.Module):
                     xy = 2.0 * xy - 1.0
                     xy = torch.clamp(xy * hscale, -1.0, 1.0)
                     
-                    padding_mode = 'zero' if torch.backends.mps.is_available() else 'border'
+                    padding_mode = 'zeros' if torch.backends.mps.is_available() else 'border'
                     sampled = F.grid_sample(v_head, xy, mode='bilinear',
                                             align_corners=False, padding_mode=padding_mode)
                     w = attn[:, :, :, head, lvl, pt].unsqueeze(1)  # [B*nW,1,ws,ws]
