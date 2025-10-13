@@ -31,6 +31,7 @@ class TrainingConfig:
     warmup_steps: int = 1000
 
     # Logging
+    use_wandb: bool = False
     log_interval: int = 50
     val_interval: int = 1000
     save_interval: int = 5000

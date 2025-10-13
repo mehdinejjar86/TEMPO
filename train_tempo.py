@@ -487,7 +487,9 @@ def main():
     parser.add_argument("--compile", action="store_true", help="Use PyTorch 2.0 compile")
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"])
-
+    
+    # Logging
+    parser.add_argument("--use_wandb", action="store_true", default=False)
 
     
     args = parser.parse_args()
