@@ -503,6 +503,7 @@ def main():
         base_channels=args.base_channels,
         temporal_channels=args.temporal_channels,
         exp_name=args.exp_name,
+        use_wandb=args.use_wandb,
         notes=args.notes,
         resume=args.resume,
         device=args.device,

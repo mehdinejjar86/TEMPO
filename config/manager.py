@@ -49,14 +49,24 @@ class RunManager:
         self.writer = SummaryWriter(self.log_dir)
         self.wandb_run = None
         
-        if WANDB_AVAILABLE and not config.resume:
-            self.wandb_run = wandb.init(
-                project=config.project_name,
-                name=run_name,
-                config=config.to_dict(),
-                notes=config.notes,
-                dir=str(self.run_dir)
-            )
+        # Lazy opt-in for wandb
+        if self.config.use_wandb:
+            try:
+                import wandb
+                self._wandb = wandb  # keep module on the instance
+                self.wandb_run = self._wandb.init(
+                    project=self.config.project_name,
+                    name=str(self.run_dir.name),
+                    config=self.config.to_dict(),
+                    notes=self.config.notes,
+                    dir=str(self.run_dir),
+                )
+            except ImportError:
+                print("⚠️ wandb not installed; continuing without it.")
+                self._wandb = None
+                self.wandb_run = None
+        else:
+            self._wandb = None
             
         print(f"📁 Run directory: {self.run_dir}")
         
