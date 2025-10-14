@@ -281,6 +281,12 @@ class TEMPOLoss(nn.Module):
                 self.perceptual = None
                 self.cfg["w_perceptual"] = 0.0
 
+    def _ensure_perc_on(self, device: torch.device):
+        if self.perceptual is not None:
+            # Only move if needed (handles MPS/CUDA/CPU)
+            cur_dev = next(self.perceptual.parameters(), None)
+            if (cur_dev is None) or (cur_dev.device != device):
+                self.perceptual = self.perceptual.to(device)
     def forward(
         self,
         pred: torch.Tensor,           # [B,3,H,W]
@@ -367,6 +373,8 @@ class TEMPOLoss(nn.Module):
 
         # ===== Perceptual loss (fp32) =====
         if self.cfg["w_perceptual"] > 0 and (self.perceptual is not None):
+            self._ensure_perc_on(pred.device)  # <-- move LPIPS/buffers to pred's device (MPS/CUDA/CPU)
+            # LPIPS expects [-1,1] and float32
             perc = self.perceptual((pred * 2 - 1).float(), (target * 2 - 1).float()).mean()
             total_recon = total_recon + self.cfg["w_perceptual"] * perc
             losses["perceptual"] = float(perc.detach())
