@@ -49,7 +49,7 @@ class Trainer:
 
         # AMP setup (unified API)
         self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
-        self.amp_dtype = torch.bfloat16 if config.amp_dtype.lower() == "bf16" else torch.float16
+        self.amp_dtype = torch.bfloat16 if config.amp_dtype.lower() == "bf16" else torch.float16 if config.amp_dtype.lower() == "fp16" else torch.float32
         self.use_autocast = (
             config.use_amp and autocast_mode.is_autocast_available(self.amp_device_type)
         )
@@ -485,8 +485,8 @@ def main():
     # Hardware
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--compile", action="store_true", help="Use PyTorch 2.0 compile")
-    parser.add_argument("--amp", action="store_true", default=True)
-    parser.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"])
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp_dtype", type=str, default="fp32", choices=["fp16", "bf16", "fp32"])
     
     # Logging
     parser.add_argument("--use_wandb", action="store_true", default=False)

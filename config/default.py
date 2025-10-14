@@ -23,8 +23,8 @@ class TrainingConfig:
     grad_clip: float = 1.0
 
     # Mixed precision
-    use_amp: bool = True
-    amp_dtype: str = "bf16"  # "fp16" or "bf16"
+    use_amp: bool = False
+    amp_dtype: str = "fp32"  # "fp16" or "bf16"
 
     # Scheduling
     lr_scheduler: str = "cosine"
