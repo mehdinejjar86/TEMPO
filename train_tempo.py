@@ -42,6 +42,9 @@ from config.manager import RunManager
 from config.dpp import setup_distributed_training, cleanup_distributed_training, is_main_process
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
 
 class Trainer:
     """Main training orchestrator"""
@@ -179,12 +182,17 @@ class Trainer:
             crop_size=None,  # Full resolution
             center_crop_eval=False
         )
+
+        self.val_sampler = None
+        if self.is_distributed:
+            self.val_sampler = DistributedSampler(val_dataset, shuffle=False) if self.is_distributed else None
         
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=1,  # Full resolution validation
             shuffle=False,
             num_workers=4,
+            sampler=self.val_sampler,
             collate_fn=vimeo_collate,
             pin_memory=True
         )
@@ -312,7 +320,7 @@ class Trainer:
 
                     )
                     
-            self.global_step += 1
+                self.global_step += 1
             
         return metric_tracker.get_averages()
         
@@ -324,6 +332,8 @@ class Trainer:
         total_psnr = 0.0
         total_ssim = 0.0
         num_samples = 0
+
+        model_to_eval = self.model.module if self.is_distributed else self.model
         
         # Select samples to visualize
         sample_indices = np.linspace(0, len(self.val_loader)-1, 
@@ -331,15 +341,19 @@ class Trainer:
         samples_to_save = []
         
         # Progress bar for validation
-        val_pbar = tqdm(
-            enumerate(self.val_loader),
-            total=min(100, len(self.val_loader)),  # Cap at 100 for speed
-            desc="Validating",
-            unit="sample",
-            ncols=100,
-            leave=False,
-            colour="green"
-        )
+        iterable = self.val_loader
+        if self.is_main_process:
+            val_pbar = tqdm(
+                enumerate(self.val_loader),
+                total=min(100, len(self.val_loader)),  # Cap at 100 for speed
+                desc="Validating",
+                unit="sample",
+                ncols=100,
+                leave=False,
+                colour="green"
+            )
+        else:
+            val_pbar = enumerate(self.val_loader)
         
         for idx, (frames, anchor_times, target_time, target) in val_pbar:
             if idx >= 100:  # Limit validation samples
@@ -351,7 +365,7 @@ class Trainer:
             target = target.to(self.device, non_blocking=True)
             
             # Forward pass
-            pred, aux = self.model(frames, anchor_times, target_time)
+            pred, aux = model_to_eval(frames, anchor_times, target_time)
             pred = pred.clamp(0, 1)
             
             # Compute metrics
@@ -371,6 +385,8 @@ class Trainer:
             total_psnr += psnr.item()
             total_ssim += ssim.item()
             num_samples += 1
+
+            
             
             # Save samples
             if idx in sample_indices:
@@ -391,8 +407,18 @@ class Trainer:
                 save_path = self.run_manager.sample_dir / f"step_{self.global_step:06d}_sample_{idx:03d}.png"
                 self._save_image_grid(viz_dict, save_path)
                 
-            val_pbar.set_postfix({'psnr': f"{psnr.item():.2f}", 'ssim': f"{ssim.item():.4f}"})
+            if self.is_main_process:    
+                val_pbar.set_postfix({'psnr': f"{psnr.item():.2f}", 'ssim': f"{ssim.item():.4f}"})
             
+
+        if self.is_distributed:
+            # Create tensors to hold the local results
+            local_results = torch.tensor([total_psnr, num_samples], dtype=torch.float64, device=self.device)
+            # Sum the results from all processes
+            dist.all_reduce(local_results, op=dist.ReduceOp.SUM)
+            # Unpack the aggregated results
+            total_psnr, num_samples = local_results[0].item(), local_results[1].item()
+
         avg_psnr = total_psnr / max(1, num_samples)
         avg_ssim = total_ssim / max(1, num_samples)
         
