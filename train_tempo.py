@@ -217,8 +217,7 @@ class Trainer:
                 bar_format="{l_bar}{bar:30}{r_bar}",
                 colour="cyan"
             )
-        else:
-            pbar = self.train_loader
+
         
         for batch_idx, (frames, anchor_times, target_time, target) in enumerate(pbar):
             # Move to device
@@ -270,13 +269,14 @@ class Trainer:
             metrics['lr'] = self.optimizer.param_groups[0]['lr']
             
             # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{metrics['total']:.4f}",
-                'l1': f"{metrics.get('l1', 0):.3f}",
-                'ssim': f"{metrics.get('ssim', 0):.3f}",
-                'psnr': f"{metrics.get('psnr', 0):.2f}",
-                'lr': f"{metrics['lr']:.1e}"
-            })
+            if self.is_main_process:
+                pbar.set_postfix({
+                    'loss': f"{metrics['total']:.4f}",
+                    'l1': f"{metrics.get('l1', 0):.3f}",
+                    'ssim': f"{metrics.get('ssim', 0):.3f}",
+                    'psnr': f"{metrics.get('psnr', 0):.2f}",
+                    'lr': f"{metrics['lr']:.1e}"
+                })
             
             # Logging
             if self.global_step % self.config.log_interval == 0:
