@@ -219,7 +219,7 @@ class Trainer:
             )
 
         
-        for batch_idx, (frames, anchor_times, target_time, target) in enumerate(pbar):
+        for batch_idx, (frames, anchor_times, target_time, target) in enumerate(self.train_loader):
             # Move to device
             frames = frames.to(self.device, non_blocking=True)
             anchor_times = anchor_times.to(self.device, non_blocking=True)
