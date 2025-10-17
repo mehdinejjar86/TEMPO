@@ -1,6 +1,5 @@
-# train_tempo.py
 """
-TEMPO v2 Training System
+TEMPO v2 Training System - Fixed Version
 Features:
 - WandB + TensorBoard logging
 - Organized run management
@@ -58,6 +57,8 @@ class Trainer:
         # Set device based on local rank
         if self.is_distributed:
             self.device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+            # Increase NCCL timeout for validation
+            os.environ['NCCL_TIMEOUT'] = '600'  # 10 minutes
         else:
             self.device = torch.device(config.device)
 
@@ -70,14 +71,20 @@ class Trainer:
             config.use_amp and autocast_mode.is_autocast_available(self.amp_device_type)
         )
 
-        # Scaler only for CUDA + fp16 (bf16/CPU don’t need scaling)
+        # Scaler only for CUDA + fp16 (bf16/CPU don't need scaling)
         if self.use_autocast and self.amp_device_type == "cuda" and self.amp_dtype == torch.float16:
             self.scaler = GradScaler(device_type="cuda")
         else:
             self.scaler = None
-        # Setup run manager
-        self.run_manager = RunManager(config)
+        
+        # Setup run manager (only on main process)
+        if self.is_main_process:
+            self.run_manager = RunManager(config)
+        else:
+            self.run_manager = None
+            
         print(f"🧪 AMP: use_autocast={self.use_autocast}, device={self.amp_device_type}, dtype={self.amp_dtype}, scaler={'yes' if self.scaler else 'no'}")
+        
         # Build model
         print("🏗️ Building model...")
         self.model = build_tempo(
@@ -113,10 +120,6 @@ class Trainer:
         # Learning rate scheduler
         self.lr_scheduler = self._build_lr_scheduler()
         
-        # Mixed precision
-        self.scaler = GradScaler() if config.use_amp else None
-        
-        
         # Training state
         self.global_step = 0
         self.epoch = 0
@@ -127,7 +130,8 @@ class Trainer:
             self._load_checkpoint(config.resume)
             
         # Print model info
-        self._print_model_info()
+        if self.is_main_process:
+            self._print_model_info()
         
     def _build_lr_scheduler(self):
         """Build learning rate scheduler"""
@@ -149,8 +153,6 @@ class Trainer:
     def _setup_data(self):
         """Setup data loaders"""
         print("📊 Loading datasets...")
-
-
         
         # Training
         train_dataset = Vimeo90KTriplet(
@@ -187,7 +189,7 @@ class Trainer:
 
         self.val_sampler = None
         if self.is_distributed:
-            self.val_sampler = DistributedSampler(val_dataset, shuffle=False) if self.is_distributed else None
+            self.val_sampler = DistributedSampler(val_dataset, shuffle=False)
         
         self.val_loader = DataLoader(
             val_dataset,
@@ -217,8 +219,13 @@ class Trainer:
         self.model.train()
         metric_tracker = MetricTracker()
         
+        # Synchronize before starting epoch
+        if self.is_distributed:
+            dist.barrier()
+        
         iterable = self.train_loader
-        # Beautiful progress bar
+        # Beautiful progress bar only on main process
+        pbar = None
         if self.is_main_process:
             pbar = tqdm(
                 self.train_loader,
@@ -228,9 +235,7 @@ class Trainer:
                 bar_format="{l_bar}{bar:30}{r_bar}",
                 colour="cyan"
             )
-
             iterable = pbar
-
         
         for batch_idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             # Move to device
@@ -245,8 +250,7 @@ class Trainer:
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = self.config.learning_rate * lr_scale
                     
-            # Forward pass
-            # Update loss schedule for *this* step
+            # Update loss schedule for this step
             self.loss_scheduler.update(self.global_step)
 
             # Forward pass with unified autocast
@@ -281,8 +285,8 @@ class Trainer:
             metric_tracker.update(metrics)
             metrics['lr'] = self.optimizer.param_groups[0]['lr']
             
-            # Update progress bar
-            if self.is_main_process:
+            # Update progress bar (only main process)
+            if self.is_main_process and pbar is not None:
                 pbar.set_postfix({
                     'loss': f"{metrics['total']:.4f}",
                     'l1': f"{metrics.get('l1', 0):.3f}",
@@ -291,15 +295,23 @@ class Trainer:
                     'lr': f"{metrics['lr']:.1e}"
                 })
             
-                # Logging
-                if self.global_step % self.config.log_interval == 0:
-                    avg_metrics = metric_tracker.get_averages()
+            # Logging (only main process)
+            if self.global_step % self.config.log_interval == 0 and self.is_main_process:
+                avg_metrics = metric_tracker.get_averages()
+                if self.run_manager:
                     self.run_manager.log_metrics(avg_metrics, self.global_step, "train")
-                    metric_tracker.reset()
+                metric_tracker.reset()
+            
+            # CRITICAL FIX: ALL processes must participate in validation
+            if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
+                # Ensure all processes are ready for validation
+                if self.is_distributed:
+                    dist.barrier()
                     
-                # Validation
-                if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
-                    val_metrics = self.validate()
+                val_metrics = self.validate()  # ALL processes run this
+                
+                # Only main process logs results
+                if self.is_main_process and self.run_manager:
                     self.run_manager.log_metrics(val_metrics, self.global_step, "val")
                     
                     # Check if best
@@ -307,23 +319,27 @@ class Trainer:
                     is_best = current_psnr > self.best_psnr
                     if is_best:
                         self.best_psnr = current_psnr
-                        
-                    # Resume training mode
-                    self.model.train()
-                    
-                # Checkpointing
-                if self.global_step % self.config.save_interval == 0 and self.global_step > 0:
+                
+                # ALL processes resume training mode
+                self.model.train()
+                
+                # Sync after validation
+                if self.is_distributed:
+                    dist.barrier()
+            
+            # Checkpointing (only main process saves)
+            if self.global_step % self.config.save_interval == 0 and self.global_step > 0 and self.is_main_process:
+                if self.run_manager:
                     self.run_manager.save_checkpoint(
                         self.model, self.optimizer, self.lr_scheduler,
                         self.global_step, self.epoch, self.best_psnr,
                         is_best=False,
                         is_main_process=self.is_main_process,
                         is_distributed=self.is_distributed,
-
                     )
-                    
-                self.global_step += 1
             
+            self.global_step += 1
+        
         return metric_tracker.get_averages()
         
     @torch.no_grad()
@@ -335,14 +351,18 @@ class Trainer:
         self.ssim_metric.reset()
         
         total_psnr = 0.0
+        total_ssim_sum = 0.0  # Track SSIM sum for manual averaging
         num_samples = 0
 
         model_to_eval = self.model.module if self.is_distributed else self.model
         
+        # ALL processes iterate through validation
         iterable = self.val_loader
+        pbar = None
         if self.is_main_process:
-            iterable = tqdm(self.val_loader, desc="Validating", unit="sample",
-                            ncols=100, leave=False, colour="green")
+            pbar = tqdm(self.val_loader, desc="Validating", unit="sample",
+                       ncols=120, leave=False, colour="green")
+            iterable = pbar
         
         for idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             frames = frames.to(self.device, non_blocking=True)
@@ -353,52 +373,71 @@ class Trainer:
             pred, aux = model_to_eval(frames, anchor_times, target_time)
             pred = pred.clamp(0, 1)
             
-            # --- Compute PSNR locally ---
+            # Compute PSNR locally
             mse = F.mse_loss(pred, target)
-            psnr = -10 * torch.log10(mse)
-            total_psnr += psnr.item() * frames.size(0) # Multiply by batch size
+            psnr = -10 * torch.log10(mse + 1e-8)  # Add epsilon for stability
+            total_psnr += psnr.item() * frames.size(0)
             num_samples += frames.size(0)
             
-            # --- [UPDATED] Update the SSIM metric on each batch ---
-            # torchmetrics handles batch-wise updates automatically
+            # Update the SSIM metric
             self.ssim_metric.update(pred, target)
             
-            # --- [UPDATED] Sample saving is now guarded by the main process check ---
+            # Also compute SSIM per-batch for display
+            batch_ssim = self.ssim_metric(pred, target).item()
+            total_ssim_sum += batch_ssim * frames.size(0)
+            
+            # Sample saving only on main process
             if self.is_main_process:
-                # We save N samples spread evenly across the main process's data slice
+                # Update progress bar with both PSNR and SSIM
+                if pbar is not None:
+                    pbar.set_postfix({
+                        'psnr': f"{psnr.item():.2f}",
+                        'ssim': f"{batch_ssim:.4f}",
+                        'avg_psnr': f"{total_psnr/num_samples:.2f}",
+                        'avg_ssim': f"{total_ssim_sum/num_samples:.4f}"
+                    })
+                
+                # Save visualization samples
                 samples_per_gpu = len(self.val_loader)
-                sample_indices = np.linspace(0, samples_per_gpu - 1, self.config.n_val_samples, dtype=int)
+                sample_indices = np.linspace(0, samples_per_gpu - 1, 
+                                            min(self.config.n_val_samples, samples_per_gpu), 
+                                            dtype=int)
                 
                 if idx in sample_indices:
                     viz_dict = {
-                        'frame0': frames[0, 0], 'frame1': frames[0, 1], 'target': target[0],
-                        'pred': pred[0], 'error': (pred[0] - target[0]).abs().mean(0, True).repeat(3,1,1),
+                        'frame0': frames[0, 0], 
+                        'frame1': frames[0, 1], 
+                        'target': target[0],
+                        'pred': pred[0], 
+                        'error': (pred[0] - target[0]).abs().mean(0, True).repeat(3,1,1),
                         'conf': aux['conf_map'][0].repeat(3,1,1) if 'conf_map' in aux else torch.zeros_like(pred[0])
                     }
                     if self.run_manager:
                         save_path = self.run_manager.sample_dir / f"step_{self.global_step:06d}_sample_{idx:03d}.png"
                         self._save_image_grid(viz_dict, save_path)
                         self.run_manager.log_images(viz_dict, self.global_step, "val")
-                
-                # Update progress bar with local (rank 0) instantaneous PSNR
-                iterable.set_postfix({'psnr': f"{psnr.item():.2f}"})
 
-        # --- Aggregate PSNR results from all GPUs ---
+        # Aggregate results from all GPUs
         if self.is_distributed:
-            # Sum the total PSNR and sample counts from all processes
-            local_results = torch.tensor([total_psnr, num_samples], dtype=torch.float64, device=self.device)
+            # Gather metrics from all processes
+            local_results = torch.tensor([total_psnr, total_ssim_sum, float(num_samples)], 
+                                        dtype=torch.float64, device=self.device)
             dist.all_reduce(local_results, op=dist.ReduceOp.SUM)
-            total_psnr, num_samples = local_results[0].item(), local_results[1].item()
+            total_psnr = local_results[0].item()
+            total_ssim_sum = local_results[1].item()
+            num_samples = int(local_results[2].item())
         
-        # --- [UPDATED] Compute the final SSIM score ---
-        # .compute() syncs results across all GPUs and returns the final average
+        # Compute final metrics
+        avg_psnr = total_psnr / max(1, num_samples)
+        avg_ssim_manual = total_ssim_sum / max(1, num_samples)
+        
+        # Get the torchmetrics SSIM (should be similar to manual)
         avg_ssim = self.ssim_metric.compute().item()
         
-        # The main process calculates and prints the final averages
-        avg_psnr = total_psnr / max(1, num_samples)
-        
         if self.is_main_process:
-            print(f"\n  📈 Validation: PSNR={avg_psnr:.2f}dB, SSIM={avg_ssim:.4f}")
+            print(f"\n  📈 Validation Results:")
+            print(f"     PSNR: {avg_psnr:.2f} dB")
+            print(f"     SSIM: {avg_ssim:.4f} (manual: {avg_ssim_manual:.4f})")
         
         return {'psnr': avg_psnr, 'ssim': avg_ssim}
     
@@ -428,7 +467,18 @@ class Trainer:
         print(f"📂 Loading checkpoint: {path}")
         checkpoint = torch.load(path, map_location=self.device)
         
-        self.model.load_state_dict(checkpoint['model_state'])
+        # Handle both DDP and non-DDP checkpoints
+        state_dict = checkpoint['model_state']
+        if self.is_distributed:
+            # If loading a non-DDP checkpoint into DDP model
+            if not any(key.startswith('module.') for key in state_dict.keys()):
+                state_dict = {'module.' + k: v for k, v in state_dict.items()}
+        else:
+            # If loading a DDP checkpoint into non-DDP model
+            if any(key.startswith('module.') for key in state_dict.keys()):
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        self.model.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
         
         if checkpoint.get('scheduler_state') and self.lr_scheduler:
@@ -442,61 +492,83 @@ class Trainer:
         
     def train(self):
         """Main training loop"""
-        print("\n🚀 Starting training...\n")
+        if self.is_main_process:
+            print("\n🚀 Starting training...\n")
         
         try:
             for epoch in range(self.epoch, self.config.epochs):
                 self.epoch = epoch
-                # --- Set sampler epoch for proper shuffling ---
-                if self.is_distributed:
-                    self.train_loader.sampler.set_epoch(epoch)
+                
+                # Set sampler epoch for proper shuffling
+                if self.is_distributed and self.train_sampler is not None:
+                    self.train_sampler.set_epoch(epoch)
+                
                 # Train epoch
                 epoch_metrics = self.train_epoch()
                 
-                # End of epoch validation
-                # --- Only main process validates and saves ---
+                # Ensure all processes are ready for validation
+                if self.is_distributed:
+                    dist.barrier()
+                
+                # End of epoch validation - ALL processes participate
+                val_metrics = self.validate()
+                
+                # Sync after validation
+                if self.is_distributed:
+                    dist.barrier()
+                
+                # Only main process logs and saves
                 if self.is_main_process:
-                    val_metrics = self.validate()
-                    
                     # Log epoch summary
                     print(f"\n📊 Epoch {epoch+1} Summary:")
                     print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
-                    print(f"  Val PSNR: {val_metrics['psnr']:.2f}dB")
+                    print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
                     print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-                    print(f"  Best PSNR: {self.best_psnr:.2f}dB")
+                    print(f"  Best PSNR: {self.best_psnr:.2f} dB")
                     
                     # Save epoch checkpoint
                     is_best = val_metrics['psnr'] > self.best_psnr
                     if is_best:
                         self.best_psnr = val_metrics['psnr']
-                        
-                    self.run_manager.save_checkpoint(
-                        self.model, self.optimizer, self.lr_scheduler,
-                        self.global_step, epoch, self.best_psnr,
-                        is_best=is_best
-                    )
-
-                cleanup_distributed_training() # Clean up at the end of training
+                    
+                    if self.run_manager:
+                        self.run_manager.save_checkpoint(
+                            self.model, self.optimizer, self.lr_scheduler,
+                            self.global_step, epoch, self.best_psnr,
+                            is_best=is_best,
+                            is_main_process=self.is_main_process,
+                            is_distributed=self.is_distributed,
+                        )
                 
         except KeyboardInterrupt:
-            print("\n\n⚠️ Training interrupted by user")
-            
+            if self.is_main_process:
+                print("\n\n⚠️ Training interrupted by user")
+                
         except Exception as e:
-            print(f"\n\n❌ Training failed: {e}")
+            if self.is_main_process:
+                print(f"\n\n❌ Training failed: {e}")
             raise
             
         finally:
-            # Final save
-            print("\n💾 Saving final checkpoint...")
-            self.run_manager.save_checkpoint(
-                self.model, self.optimizer, self.lr_scheduler,
-                self.global_step, self.epoch, self.best_psnr,
-                is_best=False
-            )
+            # Final save (only main process)
+            if self.is_main_process:
+                print("\n💾 Saving final checkpoint...")
+                if self.run_manager:
+                    self.run_manager.save_checkpoint(
+                        self.model, self.optimizer, self.lr_scheduler,
+                        self.global_step, self.epoch, self.best_psnr,
+                        is_best=False,
+                        is_main_process=self.is_main_process,
+                        is_distributed=self.is_distributed,
+                    )
+                    
+                    # Cleanup resources
+                    self.run_manager.close()
+                    print(f"\n✅ Training complete! Results saved to: {self.run_manager.run_dir}")
             
-            # Cleanup
-            self.run_manager.close()
-            print(f"\n✅ Training complete! Results saved to: {self.run_manager.run_dir}")
+            # Clean up distributed training AFTER everything else
+            if self.is_distributed:
+                cleanup_distributed_training()
 
 
 # ===========================
@@ -554,7 +626,6 @@ def main():
         amp_dtype=args.amp_dtype,
         distributed=args.distributed,
     )
-
     
     # Start training
     trainer = Trainer(config)
