@@ -151,7 +151,7 @@ class Trainer:
         train_dataset = Vimeo90KTriplet(
             root=self.config.data_root,
             split="train",
-            mode="interp",
+            mode="mix",
             crop_size=self.config.crop_size,
             aug_flip=False,
         )
@@ -304,7 +304,8 @@ class Trainer:
                     self.model, self.optimizer, self.lr_scheduler,
                     self.global_step, self.epoch, self.best_psnr,
                     is_best=False,
-                    is_main_process=self.is_main_process
+                    is_main_process=self.is_main_process,
+                    is_distributed=self.is_distributed,
 
                 )
                 

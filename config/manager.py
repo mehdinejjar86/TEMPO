@@ -97,13 +97,13 @@ class RunManager:
                 wandb.log({f"{prefix}/{name}": wandb.Image(img_np)}, step=step)
                 
     def save_checkpoint(self, model: nn.Module, optimizer, scheduler, 
-                       step: int, epoch: int, best_metric: float, is_best: bool = False, is_main_process: bool = True):
+                       step: int, epoch: int, best_metric: float, is_best: bool = False, is_main_process: bool = True, is_distributed: bool = False):
         """Save training checkpoint"""
 
         if not is_main_process:
             return
         
-        model_state = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
+        model_state = model.module.state_dict() if is_distributed else model.state_dict()
 
         checkpoint = {
             'model_state': model_state,
