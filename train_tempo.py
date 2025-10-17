@@ -84,7 +84,7 @@ class Trainer:
 
         # --- Wrap model for DDP if enabled ---
         if self.is_distributed:
-            self.model = DDP(self.model, device_ids=[self.device.index])
+            self.model = DDP(self.model, device_ids=[self.device.index], find_unused_parameters=True)
         
         if config.compile_model and hasattr(torch, 'compile'):
             print("  ⚡ Compiling model with PyTorch 2.0...")
