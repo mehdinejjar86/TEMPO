@@ -207,6 +207,7 @@ class Trainer:
         self.model.train()
         metric_tracker = MetricTracker()
         
+        iterable = self.train_loader
         # Beautiful progress bar
         if self.is_main_process:
             pbar = tqdm(
@@ -218,8 +219,10 @@ class Trainer:
                 colour="cyan"
             )
 
+            iterable = pbar
+
         
-        for batch_idx, (frames, anchor_times, target_time, target) in enumerate(self.train_loader):
+        for batch_idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             # Move to device
             frames = frames.to(self.device, non_blocking=True)
             anchor_times = anchor_times.to(self.device, non_blocking=True)
@@ -278,37 +281,37 @@ class Trainer:
                     'lr': f"{metrics['lr']:.1e}"
                 })
             
-            # Logging
-            if self.global_step % self.config.log_interval == 0:
-                avg_metrics = metric_tracker.get_averages()
-                self.run_manager.log_metrics(avg_metrics, self.global_step, "train")
-                metric_tracker.reset()
-                
-            # Validation
-            if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
-                val_metrics = self.validate()
-                self.run_manager.log_metrics(val_metrics, self.global_step, "val")
-                
-                # Check if best
-                current_psnr = val_metrics.get('psnr', 0)
-                is_best = current_psnr > self.best_psnr
-                if is_best:
-                    self.best_psnr = current_psnr
+                # Logging
+                if self.global_step % self.config.log_interval == 0:
+                    avg_metrics = metric_tracker.get_averages()
+                    self.run_manager.log_metrics(avg_metrics, self.global_step, "train")
+                    metric_tracker.reset()
                     
-                # Resume training mode
-                self.model.train()
-                
-            # Checkpointing
-            if self.global_step % self.config.save_interval == 0 and self.global_step > 0:
-                self.run_manager.save_checkpoint(
-                    self.model, self.optimizer, self.lr_scheduler,
-                    self.global_step, self.epoch, self.best_psnr,
-                    is_best=False,
-                    is_main_process=self.is_main_process,
-                    is_distributed=self.is_distributed,
+                # Validation
+                if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
+                    val_metrics = self.validate()
+                    self.run_manager.log_metrics(val_metrics, self.global_step, "val")
+                    
+                    # Check if best
+                    current_psnr = val_metrics.get('psnr', 0)
+                    is_best = current_psnr > self.best_psnr
+                    if is_best:
+                        self.best_psnr = current_psnr
+                        
+                    # Resume training mode
+                    self.model.train()
+                    
+                # Checkpointing
+                if self.global_step % self.config.save_interval == 0 and self.global_step > 0:
+                    self.run_manager.save_checkpoint(
+                        self.model, self.optimizer, self.lr_scheduler,
+                        self.global_step, self.epoch, self.best_psnr,
+                        is_best=False,
+                        is_main_process=self.is_main_process,
+                        is_distributed=self.is_distributed,
 
-                )
-                
+                    )
+                    
             self.global_step += 1
             
         return metric_tracker.get_averages()
