@@ -23,6 +23,7 @@ from torch.amp import autocast, GradScaler, autocast_mode
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import os
 
 # Optional but recommended
 try:
@@ -38,14 +39,24 @@ from model.loss.tempo_loss import build_tempo_loss, LossScheduler, MetricTracker
 from data.data_vimeo_triplet import Vimeo90KTriplet, vimeo_collate
 from config.default import TrainingConfig
 from config.manager import RunManager
-
+from config.dpp import setup_distributed_training, cleanup_distributed_training, is_main_process
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 class Trainer:
     """Main training orchestrator"""
     
     def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        # --- DDP Setup ---
+        self.is_distributed = setup_distributed_training()
+        self.is_main_process = is_main_process()
+        
+        # Set device based on local rank
+        if self.is_distributed:
+            self.device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+        else:
+            self.device = torch.device(config.device)
 
         # AMP setup (unified API)
         self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
@@ -70,6 +81,10 @@ class Trainer:
             attn_heads=config.attn_heads,
             attn_points=config.attn_points
         ).to(self.device)
+
+        # --- Wrap model for DDP if enabled ---
+        if self.is_distributed:
+            self.model = DDP(self.model, device_ids=[self.device.index])
         
         if config.compile_model and hasattr(torch, 'compile'):
             print("  ⚡ Compiling model with PyTorch 2.0...")
@@ -129,6 +144,8 @@ class Trainer:
     def _setup_data(self):
         """Setup data loaders"""
         print("📊 Loading datasets...")
+
+
         
         # Training
         train_dataset = Vimeo90KTriplet(
@@ -136,13 +153,17 @@ class Trainer:
             split="train",
             mode="interp",
             crop_size=self.config.crop_size,
-            aug_flip=True
+            aug_flip=False,
         )
+
+        self.train_sampler = None
+        if self.is_distributed:
+            self.train_sampler = DistributedSampler(train_dataset)
         
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=(self.train_sampler is None),
             num_workers=self.config.num_workers,
             collate_fn=vimeo_collate,
             pin_memory=True,
@@ -186,14 +207,15 @@ class Trainer:
         metric_tracker = MetricTracker()
         
         # Beautiful progress bar
-        pbar = tqdm(
-            self.train_loader,
-            desc=f"Epoch {self.epoch+1}/{self.config.epochs}",
-            unit="batch",
-            ncols=160,
-            bar_format="{l_bar}{bar:30}{r_bar}",
-            colour="cyan"
-        )
+        if self.is_main_process:
+            pbar = tqdm(
+                self.train_loader,
+                desc=f"Epoch {self.epoch+1}/{self.config.epochs}",
+                unit="batch",
+                ncols=160,
+                bar_format="{l_bar}{bar:30}{r_bar}",
+                colour="cyan"
+            )
         
         for batch_idx, (frames, anchor_times, target_time, target) in enumerate(pbar):
             # Move to device
@@ -278,7 +300,9 @@ class Trainer:
                 self.run_manager.save_checkpoint(
                     self.model, self.optimizer, self.lr_scheduler,
                     self.global_step, self.epoch, self.best_psnr,
-                    is_best=False
+                    is_best=False,
+                    is_main_process=self.is_main_process
+
                 )
                 
             self.global_step += 1
@@ -414,30 +438,36 @@ class Trainer:
         try:
             for epoch in range(self.epoch, self.config.epochs):
                 self.epoch = epoch
-                
+                # --- Set sampler epoch for proper shuffling ---
+                if self.is_distributed:
+                    self.train_loader.sampler.set_epoch(epoch)
                 # Train epoch
                 epoch_metrics = self.train_epoch()
                 
                 # End of epoch validation
-                val_metrics = self.validate()
-                
-                # Log epoch summary
-                print(f"\n📊 Epoch {epoch+1} Summary:")
-                print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
-                print(f"  Val PSNR: {val_metrics['psnr']:.2f}dB")
-                print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-                print(f"  Best PSNR: {self.best_psnr:.2f}dB")
-                
-                # Save epoch checkpoint
-                is_best = val_metrics['psnr'] > self.best_psnr
-                if is_best:
-                    self.best_psnr = val_metrics['psnr']
+                # --- Only main process validates and saves ---
+                if self.is_main_process:
+                    val_metrics = self.validate()
                     
-                self.run_manager.save_checkpoint(
-                    self.model, self.optimizer, self.lr_scheduler,
-                    self.global_step, epoch, self.best_psnr,
-                    is_best=is_best
-                )
+                    # Log epoch summary
+                    print(f"\n📊 Epoch {epoch+1} Summary:")
+                    print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
+                    print(f"  Val PSNR: {val_metrics['psnr']:.2f}dB")
+                    print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
+                    print(f"  Best PSNR: {self.best_psnr:.2f}dB")
+                    
+                    # Save epoch checkpoint
+                    is_best = val_metrics['psnr'] > self.best_psnr
+                    if is_best:
+                        self.best_psnr = val_metrics['psnr']
+                        
+                    self.run_manager.save_checkpoint(
+                        self.model, self.optimizer, self.lr_scheduler,
+                        self.global_step, epoch, self.best_psnr,
+                        is_best=is_best
+                    )
+
+                cleanup_distributed_training() # Clean up at the end of training
                 
         except KeyboardInterrupt:
             print("\n\n⚠️ Training interrupted by user")
@@ -491,6 +521,9 @@ def main():
     # Logging
     parser.add_argument("--use_wandb", action="store_true", default=False)
 
+    # Distributed training
+    parser.add_argument("--distributed", action="store_true",
+                        help="Enable distributed data parallel training.")
     
     args = parser.parse_args()
     
@@ -509,7 +542,8 @@ def main():
         device=args.device,
         compile_model=args.compile,
         use_amp=args.amp,
-        amp_dtype=args.amp_dtype,        # <—
+        amp_dtype=args.amp_dtype,
+        distributed=args.distributed,
     )
 
     

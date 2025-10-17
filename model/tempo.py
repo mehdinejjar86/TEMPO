@@ -1,4 +1,4 @@
-# tempo_pyramid_v2.py
+# tempo.py
 # TEMPO v2: Temporal Multi-View Frame Synthesis with Time-Aware Pyramid Attention (no optical flow)
 # Includes fixes:
 #  - Δt tiling across windows for attention bias

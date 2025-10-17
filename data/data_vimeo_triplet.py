@@ -28,9 +28,9 @@ class Vimeo90KTriplet(data.Dataset):
         root: str = "datasets/vimeo_triplet",
         split: Literal["train", "test"] = "train",
         mode: Mode = "interp",
-        crop_size: Optional[int] = 192,
-        aug_flip: bool = True,
-        center_crop_eval: bool = True,
+        crop_size: Optional[int] = None,
+        aug_flip: bool = False,
+        center_crop_eval: bool = False,
     ):
         super().__init__()
         self.root = root

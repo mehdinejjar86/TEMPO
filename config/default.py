@@ -52,6 +52,9 @@ class TrainingConfig:
     project_name: str = "TEMPO-v2"
     notes: str = ""
 
+    # Distributed Training
+    distributed: bool = False
+
     def to_dict(self):
         d = asdict(self)
         if d['loss_config'] is None:
