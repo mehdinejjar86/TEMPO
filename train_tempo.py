@@ -61,6 +61,8 @@ class Trainer:
         else:
             self.device = torch.device(config.device)
 
+        self.ssim_metric = SSIM(data_range=1.0).to(self.device)
+
         # AMP setup (unified API)
         self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
         self.amp_dtype = torch.bfloat16 if config.amp_dtype.lower() == "bf16" else torch.float16 if config.amp_dtype.lower() == "fp16" else torch.float32
@@ -326,106 +328,80 @@ class Trainer:
         
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """Validation with sample generation"""
+        """Validation with sample generation (distributed-safe with robust SSIM)."""
         self.model.eval()
         
+        # Reset the metric state at the beginning of validation
+        self.ssim_metric.reset()
+        
         total_psnr = 0.0
-        total_ssim = 0.0
         num_samples = 0
 
         model_to_eval = self.model.module if self.is_distributed else self.model
         
-        # Select samples to visualize
-        sample_indices = np.linspace(0, len(self.val_loader)-1, 
-                                    self.config.n_val_samples).astype(int)
-        samples_to_save = []
-        
-        # Progress bar for validation
         iterable = self.val_loader
         if self.is_main_process:
-            val_pbar = tqdm(
-                enumerate(self.val_loader),
-                total=min(100, len(self.val_loader)),  # Cap at 100 for speed
-                desc="Validating",
-                unit="sample",
-                ncols=100,
-                leave=False,
-                colour="green"
-            )
-        else:
-            val_pbar = enumerate(self.val_loader)
+            iterable = tqdm(self.val_loader, desc="Validating", unit="sample",
+                            ncols=100, leave=False, colour="green")
         
-        for idx, (frames, anchor_times, target_time, target) in val_pbar:
-            if idx >= 100:  # Limit validation samples
-                break
-                
+        for idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             frames = frames.to(self.device, non_blocking=True)
             anchor_times = anchor_times.to(self.device, non_blocking=True)
             target_time = target_time.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
             
-            # Forward pass
             pred, aux = model_to_eval(frames, anchor_times, target_time)
             pred = pred.clamp(0, 1)
             
-            # Compute metrics
+            # --- Compute PSNR locally ---
             mse = F.mse_loss(pred, target)
             psnr = -10 * torch.log10(mse)
+            total_psnr += psnr.item() * frames.size(0) # Multiply by batch size
+            num_samples += frames.size(0)
             
-            # Simple SSIM approximation (for speed)
-            mu_p, mu_t = pred.mean(dim=[2,3]), target.mean(dim=[2,3])
-            var_p = ((pred - mu_p.view(-1,3,1,1))**2).mean(dim=[2,3])
-            var_t = ((target - mu_t.view(-1,3,1,1))**2).mean(dim=[2,3])
-            cov = ((pred - mu_p.view(-1,3,1,1)) * (target - mu_t.view(-1,3,1,1))).mean(dim=[2,3])
+            # --- [UPDATED] Update the SSIM metric on each batch ---
+            # torchmetrics handles batch-wise updates automatically
+            self.ssim_metric.update(pred, target)
             
-            C1, C2 = 0.01**2, 0.03**2
-            ssim = ((2*mu_p*mu_t + C1) * (2*cov + C2)) / ((mu_p**2 + mu_t**2 + C1) * (var_p + var_t + C2))
-            ssim = ssim.mean()
-            
-            total_psnr += psnr.item()
-            total_ssim += ssim.item()
-            num_samples += 1
+            # --- [UPDATED] Sample saving is now guarded by the main process check ---
+            if self.is_main_process:
+                # We save N samples spread evenly across the main process's data slice
+                samples_per_gpu = len(self.val_loader)
+                sample_indices = np.linspace(0, samples_per_gpu - 1, self.config.n_val_samples, dtype=int)
+                
+                if idx in sample_indices:
+                    viz_dict = {
+                        'frame0': frames[0, 0], 'frame1': frames[0, 1], 'target': target[0],
+                        'pred': pred[0], 'error': (pred[0] - target[0]).abs().mean(0, True).repeat(3,1,1),
+                        'conf': aux['conf_map'][0].repeat(3,1,1) if 'conf_map' in aux else torch.zeros_like(pred[0])
+                    }
+                    if self.run_manager:
+                        save_path = self.run_manager.sample_dir / f"step_{self.global_step:06d}_sample_{idx:03d}.png"
+                        self._save_image_grid(viz_dict, save_path)
+                        self.run_manager.log_images(viz_dict, self.global_step, "val")
+                
+                # Update progress bar with local (rank 0) instantaneous PSNR
+                iterable.set_postfix({'psnr': f"{psnr.item():.2f}"})
 
-            
-            
-            # Save samples
-            if idx in sample_indices:
-                # Create visualization grid
-                viz_dict = {
-                    'frame0': frames[0, 0],
-                    'frame1': frames[0, 1],
-                    'target': target[0],
-                    'pred': pred[0],
-                    'error': (pred[0] - target[0]).abs().mean(dim=0, keepdim=True).repeat(3,1,1),
-                    'conf': aux['conf_map'][0].repeat(3,1,1)
-                }
-                
-                # Log to tensorboard/wandb
-                self.run_manager.log_images(viz_dict, self.global_step, "val")
-                
-                # Save to disk
-                save_path = self.run_manager.sample_dir / f"step_{self.global_step:06d}_sample_{idx:03d}.png"
-                self._save_image_grid(viz_dict, save_path)
-                
-            if self.is_main_process:    
-                val_pbar.set_postfix({'psnr': f"{psnr.item():.2f}", 'ssim': f"{ssim.item():.4f}"})
-            
-
+        # --- Aggregate PSNR results from all GPUs ---
         if self.is_distributed:
-            # Create tensors to hold the local results
+            # Sum the total PSNR and sample counts from all processes
             local_results = torch.tensor([total_psnr, num_samples], dtype=torch.float64, device=self.device)
-            # Sum the results from all processes
             dist.all_reduce(local_results, op=dist.ReduceOp.SUM)
-            # Unpack the aggregated results
             total_psnr, num_samples = local_results[0].item(), local_results[1].item()
-
-        avg_psnr = total_psnr / max(1, num_samples)
-        avg_ssim = total_ssim / max(1, num_samples)
         
-        print(f"\n  📈 Validation: PSNR={avg_psnr:.2f}dB, SSIM={avg_ssim:.4f}")
+        # --- [UPDATED] Compute the final SSIM score ---
+        # .compute() syncs results across all GPUs and returns the final average
+        avg_ssim = self.ssim_metric.compute().item()
+        
+        # The main process calculates and prints the final averages
+        avg_psnr = total_psnr / max(1, num_samples)
+        
+        if self.is_main_process:
+            print(f"\n  📈 Validation: PSNR={avg_psnr:.2f}dB, SSIM={avg_ssim:.4f}")
         
         return {'psnr': avg_psnr, 'ssim': avg_ssim}
-        
+    
     def _save_image_grid(self, images: Dict[str, torch.Tensor], path: Path):
         """Save image grid for visualization"""
         # Arrange in 2x3 grid
