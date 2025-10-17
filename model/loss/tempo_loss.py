@@ -287,6 +287,7 @@ class TEMPOLoss(nn.Module):
             cur_dev = next(self.perceptual.parameters(), None)
             if (cur_dev is None) or (cur_dev.device != device):
                 self.perceptual = self.perceptual.to(device)
+                
     def forward(
         self,
         pred: torch.Tensor,           # [B,3,H,W]
@@ -373,9 +374,21 @@ class TEMPOLoss(nn.Module):
 
         # ===== Perceptual loss (fp32) =====
         if self.cfg["w_perceptual"] > 0 and (self.perceptual is not None):
-            self._ensure_perc_on(pred.device)  # <-- move LPIPS/buffers to pred's device (MPS/CUDA/CPU)
+            self._ensure_perc_on(pred.device)
+            
+            p_perc, t_perc = pred, target
+            
+            # **[UPDATED]** Dynamically downsample for LPIPS while preserving aspect ratio
+            h_orig, w_orig = p_perc.shape[-2:]
+            target_longest_edge = 256
+            if max(h_orig, w_orig) > target_longest_edge:
+                ratio = target_longest_edge / max(h_orig, w_orig)
+                new_h, new_w = int(h_orig * ratio), int(w_orig * ratio)
+                p_perc = F.interpolate(p_perc, size=(new_h, new_w), mode='area')
+                t_perc = F.interpolate(t_perc, size=(new_h, new_w), mode='area')
+
             # LPIPS expects [-1,1] and float32
-            perc = self.perceptual((pred * 2 - 1).float(), (target * 2 - 1).float()).mean()
+            perc = self.perceptual((p_perc * 2 - 1).float(), (t_perc * 2 - 1).float()).mean()
             total_recon = total_recon + self.cfg["w_perceptual"] * perc
             losses["perceptual"] = float(perc.detach())
 

@@ -54,7 +54,7 @@ if __name__ == "__main__":
     # 2) Forward extrapolation (N=2): predict one step ahead
     # anchors: t0=0, t1=1 → target at 2.0 (model normalizes by span internally)
     # --------------------------
-    B, N, H, W = 2, 2, 192, 192
+    B, N, H, W = 1, 2, 4048, 2048
     frames = torch.rand(B, N, 3, H, W, device=device)
     anchor_times = torch.tensor([[0.0, 1.0]] * B, device=device)
     target_time = torch.tensor([2.0] * B, device=device)  # one step beyond the second anchor
