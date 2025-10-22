@@ -519,6 +519,12 @@ class Trainer:
                 
                 # Only main process logs and saves
                 if self.is_main_process:
+
+                    # Save epoch checkpoint
+                    is_best = val_metrics['psnr'] > self.best_psnr
+                    if is_best:
+                        self.best_psnr = val_metrics['psnr']
+                        
                     # Log epoch summary
                     print(f"\n📊 Epoch {epoch+1} Summary:")
                     print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
@@ -526,10 +532,7 @@ class Trainer:
                     print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
                     print(f"  Best PSNR: {self.best_psnr:.2f} dB")
                     
-                    # Save epoch checkpoint
-                    is_best = val_metrics['psnr'] > self.best_psnr
-                    if is_best:
-                        self.best_psnr = val_metrics['psnr']
+                    
                     
                     if self.run_manager:
                         self.run_manager.save_checkpoint(
