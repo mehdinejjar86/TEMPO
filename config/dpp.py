@@ -1,4 +1,4 @@
-# utils/ddp_utils.py
+# utils/ddp.py
 import os
 import torch
 import torch.distributed as dist

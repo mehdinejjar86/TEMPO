@@ -2,3 +2,4 @@
 datasets/*
 .DS_Store
 runs/*
+.vscode/*
