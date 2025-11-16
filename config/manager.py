@@ -3,7 +3,7 @@ import json
 import csv
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Set
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
@@ -20,12 +20,15 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 class CSVLogger:
-    """Simple CSV logger for metrics"""
+    """Simple CSV logger for metrics with dynamic field support"""
     def __init__(self, filepath: Path):
         self.filepath = filepath
         self.file = None
         self.writer = None
-        self.fieldnames = None
+        self.fieldnames = ['step', 'prefix']  # Start with base fields
+        self.seen_fields: Set[str] = set()
+        self.rows_buffer = []  # Buffer rows until we know all fields
+        self.initialized = False
         
     def log(self, metrics: Dict, step: int, prefix: str = "train"):
         """Log metrics to CSV"""
@@ -33,20 +36,93 @@ class CSVLogger:
         row = {"step": step, "prefix": prefix}
         row.update({f"{k}": v for k, v in metrics.items()})
         
-        # Initialize file and writer if needed
-        if self.file is None:
-            self.fieldnames = list(row.keys())
-            self.file = open(self.filepath, 'w', newline='')
-            self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
-            self.writer.writeheader()
-            self.file.flush()
+        # Track all fields we've seen
+        current_fields = set(row.keys())
+        new_fields = current_fields - self.seen_fields
+        
+        if new_fields:
+            self.seen_fields.update(current_fields)
+            # If we haven't initialized yet, just buffer
+            if not self.initialized:
+                self.rows_buffer.append(row)
+                return
+            else:
+                # Need to reinitialize with new fields
+                self._reinitialize()
         
         # Write row
-        self.writer.writerow(row)
+        if self.initialized:
+            # Fill in missing fields with empty string
+            row_with_all_fields = {field: row.get(field, '') for field in self.fieldnames}
+            self.writer.writerow(row_with_all_fields)
+            self.file.flush()
+        else:
+            self.rows_buffer.append(row)
+    
+    def _initialize(self):
+        """Initialize the CSV file with all known fields"""
+        self.fieldnames = sorted(list(self.seen_fields))
+        # Ensure step and prefix are first
+        if 'step' in self.fieldnames:
+            self.fieldnames.remove('step')
+        if 'prefix' in self.fieldnames:
+            self.fieldnames.remove('prefix')
+        self.fieldnames = ['step', 'prefix'] + sorted([f for f in self.fieldnames if f not in ['step', 'prefix']])
+        
+        self.file = open(self.filepath, 'w', newline='')
+        self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+        self.writer.writeheader()
+        
+        # Write buffered rows
+        for row in self.rows_buffer:
+            row_with_all_fields = {field: row.get(field, '') for field in self.fieldnames}
+            self.writer.writerow(row_with_all_fields)
+        
         self.file.flush()
+        self.rows_buffer.clear()
+        self.initialized = True
+    
+    def _reinitialize(self):
+        """Reinitialize CSV with new fields (read existing, rewrite with new columns)"""
+        # Close current file
+        if self.file:
+            self.file.close()
+        
+        # Read existing data
+        existing_rows = []
+        if self.filepath.exists():
+            with open(self.filepath, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                existing_rows = list(reader)
+        
+        # Update fieldnames
+        self.fieldnames = sorted(list(self.seen_fields))
+        if 'step' in self.fieldnames:
+            self.fieldnames.remove('step')
+        if 'prefix' in self.fieldnames:
+            self.fieldnames.remove('prefix')
+        self.fieldnames = ['step', 'prefix'] + sorted([f for f in self.fieldnames if f not in ['step', 'prefix']])
+        
+        # Reopen and write all data
+        self.file = open(self.filepath, 'w', newline='')
+        self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+        self.writer.writeheader()
+        
+        # Write existing rows with new fields
+        for row in existing_rows:
+            row_with_all_fields = {field: row.get(field, '') for field in self.fieldnames}
+            self.writer.writerow(row_with_all_fields)
+        
+        self.file.flush()
+    
+    def finalize(self):
+        """Finalize the CSV (write buffered data if not initialized)"""
+        if not self.initialized and self.rows_buffer:
+            self._initialize()
     
     def close(self):
         """Close the CSV file"""
+        self.finalize()
         if self.file is not None:
             self.file.close()
 
