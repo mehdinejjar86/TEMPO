@@ -1,5 +1,6 @@
 # config/manager.py
 import json
+import csv
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -17,6 +18,38 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+class CSVLogger:
+    """Simple CSV logger for metrics"""
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self.file = None
+        self.writer = None
+        self.fieldnames = None
+        
+    def log(self, metrics: Dict, step: int, prefix: str = "train"):
+        """Log metrics to CSV"""
+        # Add step and prefix to metrics
+        row = {"step": step, "prefix": prefix}
+        row.update({f"{k}": v for k, v in metrics.items()})
+        
+        # Initialize file and writer if needed
+        if self.file is None:
+            self.fieldnames = list(row.keys())
+            self.file = open(self.filepath, 'w', newline='')
+            self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+            self.writer.writeheader()
+            self.file.flush()
+        
+        # Write row
+        self.writer.writerow(row)
+        self.file.flush()
+    
+    def close(self):
+        """Close the CSV file"""
+        if self.file is not None:
+            self.file.close()
+
 
 class RunManager:
     """Manages experiment directories and logging"""
@@ -47,6 +80,14 @@ class RunManager:
             
         # Initialize loggers
         self.writer = SummaryWriter(self.log_dir)
+        
+        # CSV loggers for train and validation
+        self.csv_train = CSVLogger(self.log_dir / "train_metrics.csv")
+        self.csv_val = CSVLogger(self.log_dir / "val_metrics.csv")
+        
+        # Combined CSV with all metrics
+        self.csv_all = CSVLogger(self.log_dir / "all_metrics.csv")
+        
         self.wandb_run = None
         
         # Lazy opt-in for wandb
@@ -69,12 +110,25 @@ class RunManager:
             self._wandb = None
             
         print(f"📁 Run directory: {self.run_dir}")
+        print(f"📊 CSV logs:")
+        print(f"   - Training: {self.log_dir / 'train_metrics.csv'}")
+        print(f"   - Validation: {self.log_dir / 'val_metrics.csv'}")
+        print(f"   - All metrics: {self.log_dir / 'all_metrics.csv'}")
         
     def log_metrics(self, metrics: Dict, step: int, prefix: str = "train"):
         """Log metrics to all active loggers"""
         # TensorBoard
         for k, v in metrics.items():
             self.writer.add_scalar(f"{prefix}/{k}", v, step)
+        
+        # CSV logging
+        if prefix == "train":
+            self.csv_train.log(metrics, step, prefix)
+        elif prefix == "val":
+            self.csv_val.log(metrics, step, prefix)
+        
+        # Log to combined CSV
+        self.csv_all.log(metrics, step, prefix)
             
         # WandB
         if self.wandb_run:
@@ -109,7 +163,6 @@ class RunManager:
             'model_state': model_state,
             'step': step,
             'epoch': epoch,
-            'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
             'scheduler_state': scheduler.state_dict() if scheduler else None,
             'best_metric': best_metric,
@@ -134,5 +187,8 @@ class RunManager:
     def close(self):
         """Clean up loggers"""
         self.writer.close()
+        self.csv_train.close()
+        self.csv_val.close()
+        self.csv_all.close()
         if self.wandb_run:
             wandb.finish()
