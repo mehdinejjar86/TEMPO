@@ -103,7 +103,7 @@ class Trainer:
             self.model = torch.compile(self.model)
             
         # Loss function with scheduler
-        self.loss_fn = build_tempo_loss(config.loss_config).to(self.device)
+        self.loss_fn = build_tempo_loss(config.loss_config, config.use_uncertainty).to(self.device)
         self.loss_scheduler = LossScheduler(self.loss_fn)
         
         # Optimizer

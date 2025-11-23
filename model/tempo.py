@@ -1,6 +1,9 @@
 # tempo.py
-# TEMPO v2: Temporal Multi-View Frame Synthesis with Time-Aware Pyramid Attention (no optical flow)
-# Includes fixes:
+# TEMPO v2: Temporal Multi-View Frame Synthesis with Time-Aware Pyramid Attention
+# Updated with Hybrid Swin+ConvNeXt encoder/decoder
+# Features:
+#  - Hybrid Swin Transformer + ConvNeXt encoder with fixed dims [96, 192, 384, 768]
+#  - Progressive decoder with cross-attention
 #  - Δt tiling across windows for attention bias
 #  - 4D reference grid for grid_sample (batch sizes match)
 #  - Vectorized scene-cut fallback
@@ -16,7 +19,7 @@ from model.temporal import TemporalPositionEncoding, TemporalWeighter
 from model.utility import CutDetector
 
 # ==========================
-# TEMPO v2 (time-aware attention, robustness)
+# TEMPO v2 (Hybrid Swin+ConvNeXt)
 # ==========================
 
 class TEMPO(nn.Module):
@@ -25,31 +28,33 @@ class TEMPO(nn.Module):
                  window_size=8, shift_size=0, dt_bias_gain=1.0, max_offset_scale=1.5,
                  cut_thresh=0.35):
         super().__init__()
-        C = base_channels
+        # Note: base_channels is now ignored, we use ConvNeXt-T fixed dims
+        # Encoder outputs: [96, 192, 384, 768] at scales [H/4, H/8, H/16, H/32]
+        dims = [96, 192, 384, 768]
         Ct = temporal_channels
 
         # time enc
         self.temporal_encoder = TemporalPositionEncoding(channels=Ct)
 
-        # encoder
-        self.encoder = FrameEncoder(C, Ct)
+        # encoder (hybrid Swin+ConvNeXt)
+        self.encoder = FrameEncoder(base_channels, Ct)
 
-        # attention fusion per scale
+        # attention fusion per scale (using fixed dims)
         mk = lambda ch: TimeAwareSlidingWindowPyramidAttention(
             ch, attn_heads, attn_points, min(attn_levels_max, 8),
             window_size, shift_size, temporal_channels=Ct,
             dt_bias_gain=dt_bias_gain, max_offset_scale=max_offset_scale
         )
-        self.fuse1 = mk(C)
-        self.fuse2 = mk(C*2)
-        self.fuse3 = mk(C*4)
-        self.fuse4 = mk(C*8)
+        self.fuse1 = mk(dims[0])  # 96
+        self.fuse2 = mk(dims[1])  # 192
+        self.fuse3 = mk(dims[2])  # 384
+        self.fuse4 = mk(dims[3])  # 768
 
         # temporal weighter
         self.weighter = TemporalWeighter(Ct, use_bimodal=True)
 
         # decoder (+1 for speed token)
-        self.decoder = DecoderTimeFiLM(C, Ct + 1)
+        self.decoder = DecoderTimeFiLM(base_channels, Ct + 1)
 
         # cut detector
         self.cut_detector = CutDetector(thresh=cut_thresh)
@@ -57,16 +62,24 @@ class TEMPO(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize weights (encoder/decoder have their own init)"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-                if m.bias is not None: init.constant_(m.bias, 0)
+                # Skip if already initialized by encoder/decoder
+                if not hasattr(m, '_initialized'):
+                    init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                    if m.bias is not None: 
+                        init.constant_(m.bias, 0)
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                if hasattr(m, 'weight') and m.weight is not None: init.constant_(m.weight, 1)
-                if hasattr(m, 'bias') and m.bias is not None: init.constant_(m.bias, 0)
+                if hasattr(m, 'weight') and m.weight is not None: 
+                    init.constant_(m.weight, 1)
+                if hasattr(m, 'bias') and m.bias is not None: 
+                    init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None: init.constant_(m.bias, 0)
+                if not hasattr(m, '_initialized'):
+                    init.normal_(m.weight, 0, 0.01)
+                    if m.bias is not None: 
+                        init.constant_(m.bias, 0)
 
     def _build_speed_token(self, anchor_times, target_time):
         # scalar describing global spacing; here use median gap / (span + eps)
@@ -110,22 +123,22 @@ class TEMPO(nn.Module):
             low_feats.append(f4)
 
         # ----- scene cut robustness (vectorized) -----
-        lf = torch.stack(low_feats, dim=1)  # [B,N,C8,H/8,W/8]
+        lf = torch.stack(low_feats, dim=1)  # [B,N,768,H/32,W/32]
         nearest_idx = (anchor_times - target_time).abs().argmin(dim=1)  # [B]
         dir_right = (anchor_times.gather(1, nearest_idx.unsqueeze(1)) <= target_time).squeeze(1)  # [B] bool
         alt_idx = nearest_idx + torch.where(dir_right, torch.tensor(1, device=device), torch.tensor(-1, device=device))
         alt_idx = alt_idx.clamp(0, N - 1)
         batch_ids = torch.arange(B, device=device)
-        f_near = lf[batch_ids, nearest_idx]  # [B,C8,H/8,W/8]
-        f_alt  = lf[batch_ids, alt_idx]      # [B,C8,H/8,W/8]
+        f_near = lf[batch_ids, nearest_idx]  # [B,768,H/32,W/32]
+        f_alt  = lf[batch_ids, alt_idx]      # [B,768,H/32,W/32]
         cut_mask, cut_score = self.cut_detector(f_near, f_alt)  # [B], [B]
         use_fallback = cut_mask > 0.5
 
         # ----- fusion per scale -----
-        s1 = torch.stack(feats1, dim=1)  # [B,N,C,H,W]
-        s2 = torch.stack(feats2, dim=1)
-        s3 = torch.stack(feats3, dim=1)
-        s4 = torch.stack(feats4, dim=1)
+        s1 = torch.stack(feats1, dim=1)  # [B,N,96,H/4,W/4]
+        s2 = torch.stack(feats2, dim=1)  # [B,N,192,H/8,W/8]
+        s3 = torch.stack(feats3, dim=1)  # [B,N,384,H/16,W/16]
+        s4 = torch.stack(feats4, dim=1)  # [B,N,768,H/32,W/32]
 
         wv = weights.view(B, N, 1, 1, 1)
         q1 = (s1 * wv).sum(dim=1)
@@ -193,6 +206,3 @@ def build_tempo(base_channels=64, temporal_channels=64,
                    cut_thresh=0.35):
     return TEMPO(base_channels, temporal_channels, attn_heads, attn_points, attn_levels_max,
                  window_size, shift_size, dt_bias_gain, max_offset_scale, cut_thresh)
-
-
-

@@ -216,50 +216,75 @@ class WeightRegularization(nn.Module):
 
 class TEMPOLoss(nn.Module):
     """
-    Improved loss that:
-    1. Adapts to N frames (works with 2 but scales)
-    2. Leverages confidence and attention entropy
-    3. Handles occlusions intelligently
-    4. Preserves both structure and details
+    Improved loss with LEARNABLE UNCERTAINTY-BASED WEIGHTING
+    
+    Instead of manually tuning weights like:
+        total_loss = 0.8*L1 + 1.0*SSIM + 0.3*freq + ...
+    
+    The network learns optimal weights automatically using uncertainty parameters!
+    
+    Based on: "Multi-Task Learning Using Uncertainty to Weigh Losses" (Kendall et al.)
+    Formula: L_weighted = exp(-log_var) * L + log_var
+    
+    Features:
+    1. Automatic loss balancing (no manual tuning!)
+    2. Adapts to N frames
+    3. Confidence and entropy aware
+    4. Handles occlusions intelligently
+    5. Can toggle between uncertainty and fixed weights
     """
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict] = None, use_uncertainty_weighting: bool = True):
         super().__init__()
+        
+        self.use_uncertainty = use_uncertainty_weighting
+        
         self.cfg = {
-            # Core reconstruction
+            # Fixed weights (only used if uncertainty_weighting=False)
             "w_l1": 0.8,
             "w_ssim": 1.0,
             "w_freq_struct": 0.3,
             "w_freq_phase": 0.1,
-
-            # Temporal
             "w_coherence": 0.2,
-
-            # Occlusion handling
             "w_occlusion": 0.5,
-
-            # Weight regularization
             "w_weight_entropy": 0.01,
             "w_weight_smooth": 0.005,
             "w_weight_coverage": 0.02,
             "w_weight_sparsity": 0.005,
-
-            # Confidence shaping
             "w_conf_target": 0.01,
-            "conf_target": 0.7,
-
-            # Multi-scale
-            "pyramid_weights": [1.0, 0.5, 0.25],
-
-            # Perceptual (optional)
             "w_perceptual": 0.05,
+            
+            # Other settings
+            "conf_target": 0.7,
+            "pyramid_weights": [1.0, 0.5, 0.25],
             "use_perceptual": True,
-
-            # Scene cut handling
-            "cut_loss_scale": 0.3,  # Reduce loss when cut detected
+            "cut_loss_scale": 0.3,
         }
         if config:
             self.cfg.update(config)
-
+        
+        # ===== LEARNABLE UNCERTAINTY PARAMETERS =====
+        if self.use_uncertainty:
+            # Main reconstruction losses
+            self.log_var_l1 = nn.Parameter(torch.zeros(1))
+            self.log_var_ssim = nn.Parameter(torch.zeros(1))
+            self.log_var_freq_struct = nn.Parameter(torch.zeros(1))
+            self.log_var_freq_phase = nn.Parameter(torch.zeros(1))
+            self.log_var_perceptual = nn.Parameter(torch.zeros(1))
+            
+            # Temporal & spatial consistency
+            self.log_var_temporal = nn.Parameter(torch.zeros(1))
+            self.log_var_occlusion = nn.Parameter(torch.zeros(1))
+            
+            # Regularization (grouped together)
+            self.log_var_regularization = nn.Parameter(torch.zeros(1))
+            
+            print("✨ Using learnable uncertainty-based loss weighting!")
+            print("   Loss weights will be optimized automatically during training.")
+            print("   Initial effective weights: all = 1.0 (log_var = 0)")
+        else:
+            print("📊 Using fixed loss weights from config.")
+        
+        # Loss components
         self.charb = AdaptiveCharbonnier(scales=3, eps_scale=1e-3)
         self.ssim = ConfidenceAwareSSIM()
         self.freq_loss = FrequencyLoss()
@@ -271,7 +296,7 @@ class TEMPOLoss(nn.Module):
         self.perceptual = None
         if self.cfg["use_perceptual"]:
             try:
-                import lpips  # type: ignore
+                import lpips
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message=".*'pretrained' is deprecated.*")
                     self.perceptual = lpips.LPIPS(net="vgg")
@@ -279,36 +304,67 @@ class TEMPOLoss(nn.Module):
                     p.requires_grad = False
             except Exception:
                 self.perceptual = None
-                self.cfg["w_perceptual"] = 0.0
-
+    
+    def _uncertainty_loss(self, loss_value: torch.Tensor, log_var: nn.Parameter) -> torch.Tensor:
+        """
+        Uncertainty-weighted loss formula from Kendall et al.
+        
+        L_weighted = 0.5 * exp(-log_var) * loss + 0.5 * log_var
+        
+        Intuition:
+        - exp(-log_var) = precision (inverse variance)
+        - High uncertainty → low precision → low weight
+        - The +log_var term prevents collapse to infinite uncertainty
+        """
+        precision = torch.exp(-log_var)
+        return 0.5 * precision * loss_value + 0.5 * log_var
+    
+    def get_learned_weights(self) -> Dict[str, float]:
+        """
+        Get the current learned weights (useful for logging/debugging)
+        Returns effective weights as precision = exp(-log_var)
+        """
+        if not self.use_uncertainty:
+            return {}
+        
+        return {
+            'l1': torch.exp(-self.log_var_l1).item(),
+            'ssim': torch.exp(-self.log_var_ssim).item(),
+            'freq_struct': torch.exp(-self.log_var_freq_struct).item(),
+            'freq_phase': torch.exp(-self.log_var_freq_phase).item(),
+            'perceptual': torch.exp(-self.log_var_perceptual).item(),
+            'temporal': torch.exp(-self.log_var_temporal).item(),
+            'occlusion': torch.exp(-self.log_var_occlusion).item(),
+            'regularization': torch.exp(-self.log_var_regularization).item(),
+        }
+    
     def _ensure_perc_on(self, device: torch.device):
         if self.perceptual is not None:
-            # Only move if needed (handles MPS/CUDA/CPU)
             cur_dev = next(self.perceptual.parameters(), None)
             if (cur_dev is None) or (cur_dev.device != device):
                 self.perceptual = self.perceptual.to(device)
                 
     def forward(
         self,
-        pred: torch.Tensor,           # [B,3,H,W]
-        target: torch.Tensor,         # [B,3,H,W]
-        frames: torch.Tensor,         # [B,N,3,H,W]
-        anchor_times: torch.Tensor,   # [B,N]
-        target_time: torch.Tensor,    # [B] or [B,1]
-        aux: Dict[str, torch.Tensor], # model aux
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        frames: torch.Tensor,
+        anchor_times: torch.Tensor,
+        target_time: torch.Tensor,
+        aux: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
 
         device = pred.device
         B, _, H, W = pred.shape
         N = frames.shape[1]
 
-        # Aux
+        # Extract auxiliary outputs
         weights = aux.get("weights", torch.full((B, max(N, 1)), 1.0 / max(N, 1), device=device))
         conf_map = aux.get("conf_map", torch.ones(B, 1, H, W, device=device)).to(dtype=pred.dtype)
         attn_entropy = aux.get("attn_entropy", torch.zeros(B, 1, H, W, device=device)).to(dtype=pred.dtype)
         fallback_mask = aux.get("fallback_mask", torch.zeros(B, device=device))
 
-        # Scene-cut gate scalar per-sample → broadcast later (match pred dtype)
+        # Scene-cut gate
         gate = torch.where(
             fallback_mask > 0.5,
             torch.tensor(self.cfg["cut_loss_scale"], device=device, dtype=pred.dtype),
@@ -318,87 +374,123 @@ class TEMPOLoss(nn.Module):
         losses: Dict[str, float] = {}
 
         # ===== Multi-scale reconstruction =====
+        L1_total = pred.new_tensor(0.0)
+        SSIM_total = pred.new_tensor(0.0)
+        
         pw = self.cfg["pyramid_weights"]
-        total_recon = pred.new_tensor(0.0)
-
         for si, w_si in enumerate(pw[:3]):
             s = 2 ** si
             if s == 1:
-                p_s, t_s = pred, target
-                c_s = conf_map
+                p_s, t_s, c_s = pred, target, conf_map
             else:
                 p_s = F.avg_pool2d(pred, s, s)
                 t_s = F.avg_pool2d(target, s, s)
                 c_s = F.avg_pool2d(conf_map, s, s)
 
-            # L1 (Charb) + SSIM; both gated consistently
             L1 = self.charb(p_s - t_s, si) * c_s * gate
             SS = self.ssim(p_s, t_s, c_s) * gate.mean()
 
-            total_recon = total_recon + w_si * (self.cfg["w_l1"] * L1.mean() + self.cfg["w_ssim"] * SS)
+            L1_total = L1_total + w_si * L1.mean()
+            SSIM_total = SSIM_total + w_si * SS
 
             if s == 1:
                 losses["l1"] = float(L1.mean().detach())
                 losses["ssim"] = float(SS.detach())
 
-        # ===== Frequency domain loss (detail preservation) =====
+        # ===== Frequency domain =====
         freq_struct, freq_phase = self.freq_loss(pred * gate, target * gate)
-        total_recon = total_recon + self.cfg["w_freq_struct"] * freq_struct + self.cfg["w_freq_phase"] * freq_phase
         losses["freq_struct"] = float(freq_struct.detach())
         losses["freq_phase"] = float(freq_phase.detach())
 
-        # ===== Temporal coherence (only if N > 1) =====
+        # ===== Temporal coherence =====
+        L_temporal = pred.new_tensor(0.0)
         if N > 1:
-            L_temp = self.temporal(frames, anchor_times, pred, target_time, weights)
-            total_recon = total_recon + self.cfg["w_coherence"] * L_temp
-            losses["temporal"] = float(L_temp.detach())
+            L_temporal = self.temporal(frames, anchor_times, pred, target_time, weights)
+            losses["temporal"] = float(L_temporal.detach())
 
-        # ===== Occlusion-aware RGB term =====
-        L_occ = self.occlusion(pred, target, conf_map, attn_entropy)
-        total_recon = total_recon + self.cfg["w_occlusion"] * L_occ
-        losses["occlusion"] = float(L_occ.detach())
+        # ===== Occlusion-aware =====
+        L_occlusion = self.occlusion(pred, target, conf_map, attn_entropy)
+        losses["occlusion"] = float(L_occlusion.detach())
 
-        # ===== Weight regularization =====
-        reg = pred.new_tensor(0.0)
+        # ===== Regularization =====
+        reg_total = pred.new_tensor(0.0)
         wreg = self.weight_reg(weights, anchor_times, target_time)
-        for k, v in wreg.items():  # entropy, temporal_smooth, coverage, sparsity
-            coef = self.cfg.get(f"w_weight_{k}", 0.0)
+        
+        for k, v in wreg.items():
+            if self.use_uncertainty:
+                # When using uncertainty, all reg terms share one log_var
+                coef = 1.0 if k in ['entropy', 'temporal_smooth', 'coverage', 'sparsity'] else 0.0
+            else:
+                coef = self.cfg.get(f"w_weight_{k}", 0.0)
+            
             if coef > 0:
-                reg = reg + coef * v
+                reg_total = reg_total + coef * v
                 losses[f"wreg_{k}"] = float(v.detach())
 
-        # ===== Confidence target =====
+        # Confidence target
         L_conf_tgt = ((conf_map - self.cfg["conf_target"]) ** 2).mean()
-        reg = reg + self.cfg["w_conf_target"] * L_conf_tgt
+        reg_total = reg_total + 0.01 * L_conf_tgt  # Small fixed weight
         losses["conf_target"] = float(L_conf_tgt.detach())
 
-        # ===== Perceptual loss (fp32) =====
-        if self.cfg["w_perceptual"] > 0 and (self.perceptual is not None):
-            self._ensure_perc_on(pred.device)
+        # ===== Perceptual =====
+        L_perceptual = pred.new_tensor(0.0)
+        if self.cfg["use_perceptual"] and (self.perceptual is not None):
+            self._ensure_perc_on(device)
             
             p_perc, t_perc = pred, target
-            
-            # **[UPDATED]** Dynamically downsample for LPIPS while preserving aspect ratio
             h_orig, w_orig = p_perc.shape[-2:]
-            target_longest_edge = 256
-            if max(h_orig, w_orig) > target_longest_edge:
-                ratio = target_longest_edge / max(h_orig, w_orig)
+            if max(h_orig, w_orig) > 256:
+                ratio = 256 / max(h_orig, w_orig)
                 new_h, new_w = int(h_orig * ratio), int(w_orig * ratio)
                 p_perc = F.interpolate(p_perc, size=(new_h, new_w), mode='area')
                 t_perc = F.interpolate(t_perc, size=(new_h, new_w), mode='area')
 
-            # LPIPS expects [-1,1] and float32
-            perc = self.perceptual((p_perc * 2 - 1).float(), (t_perc * 2 - 1).float()).mean()
-            total_recon = total_recon + self.cfg["w_perceptual"] * perc
-            losses["perceptual"] = float(perc.detach())
+            L_perceptual = self.perceptual((p_perc * 2 - 1).float(), (t_perc * 2 - 1).float()).mean()
+            losses["perceptual"] = float(L_perceptual.detach())
 
-        total = total_recon + reg
+        # ===== COMBINE LOSSES =====
+        if self.use_uncertainty:
+            # Use learnable uncertainty weights
+            total = (
+                self._uncertainty_loss(L1_total, self.log_var_l1) +
+                self._uncertainty_loss(SSIM_total, self.log_var_ssim) +
+                self._uncertainty_loss(freq_struct, self.log_var_freq_struct) +
+                self._uncertainty_loss(freq_phase, self.log_var_freq_phase) +
+                self._uncertainty_loss(L_temporal, self.log_var_temporal) +
+                self._uncertainty_loss(L_occlusion, self.log_var_occlusion) +
+                self._uncertainty_loss(L_perceptual, self.log_var_perceptual) +
+                self._uncertainty_loss(reg_total, self.log_var_regularization)
+            )
+            
+            # Log learned weights for monitoring
+            learned_weights = self.get_learned_weights()
+            for k, v in learned_weights.items():
+                losses[f"learned_weight/{k}"] = v
+            
+            # Log uncertainties (log-variance)
+            losses["uncertainty/l1"] = float(self.log_var_l1.detach())
+            losses["uncertainty/ssim"] = float(self.log_var_ssim.detach())
+            losses["uncertainty/freq_struct"] = float(self.log_var_freq_struct.detach())
+            
+        else:
+            # Use fixed weights from config
+            total = (
+                self.cfg["w_l1"] * L1_total +
+                self.cfg["w_ssim"] * SSIM_total +
+                self.cfg["w_freq_struct"] * freq_struct +
+                self.cfg["w_freq_phase"] * freq_phase +
+                self.cfg["w_coherence"] * L_temporal +
+                self.cfg["w_occlusion"] * L_occlusion +
+                self.cfg["w_perceptual"] * L_perceptual +
+                reg_total
+            )
+
         losses["total"] = float(total.detach())
         losses["cut_rate"] = float(fallback_mask.float().mean().detach())
         losses["conf_mean"] = float(conf_map.mean().detach())
         losses["entropy_mean"] = float(attn_entropy.mean().detach())
         
-        # ===== Metrics (not used for gradients) =====
+        # Metrics
         psnr_db, mse_val = _batch_psnr(pred, target)
         losses["mse"] = float(mse_val)
         losses["psnr"] = float(psnr_db)
@@ -406,9 +498,16 @@ class TEMPOLoss(nn.Module):
         return total, losses
 
 
-
-def build_tempo_loss(config: Optional[Dict] = None) -> TEMPOLoss:
-    return TEMPOLoss(config)
+# ===== UPDATED FACTORY =====
+def build_tempo_loss(config: Optional[Dict] = None, use_uncertainty: bool = True) -> TEMPOLoss:
+    """
+    Build TEMPO loss with optional uncertainty-based weighting
+    
+    Args:
+        config: Loss configuration dict
+        use_uncertainty: If True, use learnable uncertainty weights (recommended!)
+    """
+    return TEMPOLoss(config, use_uncertainty_weighting=use_uncertainty)
 
 
 # ===== Training utilities =====

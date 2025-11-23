@@ -39,6 +39,7 @@ class TrainingConfig:
 
     # Loss weights (override defaults)
     loss_config: Optional[Dict] = None
+    use_uncertainty: bool = True
 
     # Resume
     resume: Optional[str] = None
