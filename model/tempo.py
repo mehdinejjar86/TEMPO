@@ -1,9 +1,9 @@
 # tempo.py
 # TEMPO v2: Temporal Multi-View Frame Synthesis with Time-Aware Pyramid Attention
-# Updated with Hybrid Swin+ConvNeXt encoder/decoder
+# Updated with Pure ConvNeXt encoder/decoder
 # Features:
-#  - Hybrid Swin Transformer + ConvNeXt encoder with fixed dims [96, 192, 384, 768]
-#  - Progressive decoder with cross-attention
+#  - Pure ConvNeXt encoder (21 blocks) with fixed dims [96, 192, 384, 768]
+#  - Progressive decoder
 #  - Δt tiling across windows for attention bias
 #  - 4D reference grid for grid_sample (batch sizes match)
 #  - Vectorized scene-cut fallback
@@ -19,7 +19,7 @@ from model.temporal import TemporalPositionEncoding, TemporalWeighter
 from model.utility import CutDetector
 
 # ==========================
-# TEMPO v2 (Hybrid Swin+ConvNeXt)
+# TEMPO v2 (Pure ConvNeXt)
 # ==========================
 
 class TEMPO(nn.Module):
@@ -28,7 +28,7 @@ class TEMPO(nn.Module):
                  window_size=8, shift_size=0, dt_bias_gain=1.0, max_offset_scale=1.5,
                  cut_thresh=0.35):
         super().__init__()
-        # Note: base_channels is now ignored, we use ConvNeXt-T fixed dims
+        # Note: base_channels is now ignored, we use fixed dims
         # Encoder outputs: [96, 192, 384, 768] at scales [H/4, H/8, H/16, H/32]
         dims = [96, 192, 384, 768]
         Ct = temporal_channels

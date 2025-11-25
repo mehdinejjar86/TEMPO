@@ -12,23 +12,23 @@ class TrainingConfig:
 
     # Data
     data_root: str = "datasets/vimeo_triplet"
-    batch_size: int = 4
+    batch_size: int = 8  # Increased for Swin stability (was 4)
     num_workers: int = 8
     crop_size: Optional[int] = None
 
-    # Training
+    # Training (optimized for 49M param hybrid Swin+ConvNeXt)
     epochs: int = 100
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
+    learning_rate: float = 5e-5  # Reduced for large model (was 1e-4)
+    weight_decay: float = 5e-5   # Increased regularization (was 1e-5)
     grad_clip: float = 1.0
 
-    # Mixed precision
-    use_amp: bool = False
-    amp_dtype: str = "fp32"  # "fp16" or "bf16"
+    # Mixed precision (CRITICAL for Swin Transformer!)
+    use_amp: bool = True         # M-series Macs support AMP
+    amp_dtype: str = "bf16"      # BF16 best for Swin + Apple Silicon
 
     # Scheduling
     lr_scheduler: str = "cosine"
-    warmup_steps: int = 1000
+    warmup_steps: int = 5000     # Longer warmup for large model (was 1000)
 
     # Logging
     use_wandb: bool = False
@@ -40,12 +40,16 @@ class TrainingConfig:
     # Loss weights (override defaults)
     loss_config: Optional[Dict] = None
     use_uncertainty: bool = True
+    
+    # Self-distillation (anchor reconstruction)
+    use_self_distillation: bool = True
+    lambda_recon: float = 0.1
 
     # Resume
     resume: Optional[str] = None
 
     # Hardware
-    device: str = "cuda"
+    device: str = "mps"  # Changed for M-series Macs (was "cuda")
     compile_model: bool = False
 
     # Experiment

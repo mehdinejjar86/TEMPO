@@ -132,6 +132,10 @@ class Trainer:
         # Print model info
         if self.is_main_process:
             self._print_model_info()
+            if self.config.use_self_distillation:
+                print(f"\n🎯 Self-Distillation Enabled:")
+                print(f"  Lambda (recon weight): {self.config.lambda_recon}")
+                print(f"  Anchor frames will be reconstructed at their own times")
         
     def _build_lr_scheduler(self):
         """Build learning rate scheduler"""
@@ -258,9 +262,33 @@ class Trainer:
                 with autocast(self.amp_device_type, dtype=self.amp_dtype):
                     pred, aux = self.model(frames, anchor_times, target_time)
                     loss, metrics = self.loss_fn(pred, target, frames, anchor_times, target_time, aux)
+                    
+                    # Self-distillation: reconstruct anchor frames
+                    if self.config.use_self_distillation:
+                        N = frames.shape[1]
+                        recon_loss = 0
+                        for i in range(N):
+                            recon_i, _ = self.model(frames, anchor_times, anchor_times[:, i:i+1])
+                            recon_loss += F.l1_loss(recon_i, frames[:, i])
+                        recon_loss = recon_loss / N
+                        
+                        loss = loss + self.config.lambda_recon * recon_loss
+                        metrics['recon'] = recon_loss.item()
             else:
                 pred, aux = self.model(frames, anchor_times, target_time)
                 loss, metrics = self.loss_fn(pred, target, frames, anchor_times, target_time, aux)
+                
+                # Self-distillation: reconstruct anchor frames
+                if self.config.use_self_distillation:
+                    N = frames.shape[1]
+                    recon_loss = 0
+                    for i in range(N):
+                        recon_i, _ = self.model(frames, anchor_times, anchor_times[:, i:i+1])
+                        recon_loss += F.l1_loss(recon_i, frames[:, i])
+                    recon_loss = recon_loss / N
+                    
+                    loss = loss + self.config.lambda_recon * recon_loss
+                    metrics['recon'] = recon_loss.item()
 
             # Backward
             self.optimizer.zero_grad(set_to_none=True)
@@ -287,13 +315,16 @@ class Trainer:
             
             # Update progress bar (only main process)
             if self.is_main_process and pbar is not None:
-                pbar.set_postfix({
+                postfix_dict = {
                     'loss': f"{metrics['total']:.4f}",
                     'l1': f"{metrics.get('l1', 0):.3f}",
                     'ssim': f"{metrics.get('ssim', 0):.3f}",
                     'psnr': f"{metrics.get('psnr', 0):.2f}",
                     'lr': f"{metrics['lr']:.1e}"
-                })
+                }
+                if self.config.use_self_distillation and 'recon' in metrics:
+                    postfix_dict['recon'] = f"{metrics['recon']:.3f}"
+                pbar.set_postfix(postfix_dict)
             
             # Logging (only main process)
             if self.global_step % self.config.log_interval == 0 and self.is_main_process:
@@ -604,6 +635,10 @@ def main():
     
     # Logging
     parser.add_argument("--use_wandb", action="store_true", default=False)
+    
+    # Self-distillation
+    parser.add_argument("--no_self_distillation", action="store_true", help="Disable self-distillation loss")
+    parser.add_argument("--lambda_recon", type=float, default=0.1, help="Weight for reconstruction loss")
 
     # Distributed training
     parser.add_argument("--distributed", action="store_true",
@@ -628,6 +663,8 @@ def main():
         use_amp=args.amp,
         amp_dtype=args.amp_dtype,
         distributed=args.distributed,
+        use_self_distillation=not args.no_self_distillation,
+        lambda_recon=args.lambda_recon,
     )
     
     # Start training

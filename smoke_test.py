@@ -15,7 +15,7 @@ from model.tempo import build_tempo
 
 def test_forward_pass():
     """Test basic forward pass with different input configurations"""
-    print("🧪 Testing TEMPO v2 with Hybrid Swin+ConvNeXt...\n")
+    print("🧪 Testing TEMPO v2 with ConvNeXt...\n")
     
     # Build model
     print("Building model...")

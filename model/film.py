@@ -1,10 +1,11 @@
 # film.py
-# Hybrid Swin Transformer + ConvNeXt Encoder/Decoder with FiLM temporal conditioning
+# Pure ConvNeXt Encoder/Decoder with FiLM temporal conditioning
 # Architecture:
-#   Stage 1 (H/4):  ConvNeXt only        [96 ch,  3 blocks]  ← Local features
-#   Stage 2 (H/8):  ConvNeXt + Swin      [192 ch, 3+3 blocks] ← Hybrid
-#   Stage 3 (H/16): ConvNeXt + Swin      [384 ch, 3+6 blocks] ← More global  
-#   Stage 4 (H/32): Swin only            [768 ch, 3 blocks]  ← Pure global
+#   Stage 1 (H/4):  ConvNeXt [96 ch,  3 blocks]
+#   Stage 2 (H/8):  ConvNeXt [192 ch, 6 blocks]
+#   Stage 3 (H/16): ConvNeXt [384 ch, 9 blocks]
+#   Stage 4 (H/32): ConvNeXt [768 ch, 3 blocks]
+# Total: 21 ConvNeXt blocks, ~49M params
 
 import torch
 import torch.nn as nn
@@ -287,43 +288,7 @@ class SwinTransformerBlock(nn.Module):
 # Cross-Attention Block (Decoder queries Encoder)
 # ==========================
 
-class CrossAttentionBlock(nn.Module):
-    """Cross-attention: decoder queries encoder skip features"""
-    def __init__(self, query_dim, context_dim, num_heads, dim_head=64):
-        super().__init__()
-        inner_dim = dim_head * num_heads
-        
-        self.num_heads = num_heads
-        self.scale = dim_head ** -0.5
-        
-        self.to_q = nn.Conv2d(query_dim, inner_dim, 1, bias=False)
-        self.to_k = nn.Conv2d(context_dim, inner_dim, 1, bias=False)
-        self.to_v = nn.Conv2d(context_dim, inner_dim, 1, bias=False)
-        self.to_out = nn.Conv2d(inner_dim, query_dim, 1)
-        
-    def forward(self, query, context):
-        """
-        query: [B, C_q, H, W] - decoder features
-        context: [B, C_k, H, W] - encoder skip features
-        """
-        B, _, H, W = query.shape
-        h = self.num_heads
-        
-        q = self.to_q(query)    # [B, inner_dim, H, W]
-        k = self.to_k(context)
-        v = self.to_v(context)
-        
-        # Reshape for multi-head attention
-        q = q.reshape(B, h, -1, H*W).permute(0, 1, 3, 2)  # [B, h, HW, d]
-        k = k.reshape(B, h, -1, H*W).permute(0, 1, 3, 2)
-        v = v.reshape(B, h, -1, H*W).permute(0, 1, 3, 2)
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        out = (attn @ v).permute(0, 1, 3, 2).reshape(B, -1, H, W)
-        return self.to_out(out)
+
 
 
 # ==========================
@@ -332,33 +297,31 @@ class CrossAttentionBlock(nn.Module):
 
 class FrameEncoder(nn.Module):
     """
-    Hybrid Swin Transformer + ConvNeXt Encoder
+    Pure ConvNeXt Encoder (NO Swin Transformer)
     
     Architecture:
-    - Stage 1 (H/4):  ConvNeXt only        [96 ch,  3 blocks]
-    - Stage 2 (H/8):  ConvNeXt + Swin      [192 ch, 3+3 blocks]
-    - Stage 3 (H/16): ConvNeXt + Swin      [384 ch, 3+6 blocks]
-    - Stage 4 (H/32): Swin only            [768 ch, 3 blocks]
+    - Stage 1 (H/4):  ConvNeXt [96 ch,  3 blocks]
+    - Stage 2 (H/8):  ConvNeXt [192 ch, 6 blocks]
+    - Stage 3 (H/16): ConvNeXt [384 ch, 9 blocks]
+    - Stage 4 (H/32): ConvNeXt [768 ch, 3 blocks]
+    
+    Total: 21 ConvNeXt blocks, ~49M params
     """
     def __init__(self, base_channels=64, temporal_channels=64, drop_path_rate=0.1):
         super().__init__()
         
-        # Note: base_channels is ignored, we use fixed ConvNeXt-T dims
-        # dims: [96, 192, 384, 768]
         dims = [96, 192, 384, 768]
-        # Total blocks per stage (Stage2=3+3=6, Stage3=3+6=9)
-        depths = [3, 6, 9, 3]  # num blocks per stage
+        depths = [3, 6, 9, 3]  # All ConvNeXt
         
-        # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         
-        # ===== Stem: Patchify 4x4 (RGB → 96 channels) =====
+        # Stem: Patchify 4x4
         self.stem = nn.Sequential(
             nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
             LayerNorm(dims[0], eps=1e-6, data_format="channels_first")
         )
         
-        # ===== Stage 1: H/4, Pure ConvNeXt =====
+        # Stage 1: H/4
         cur = 0
         self.stage1 = nn.ModuleList([
             ConvNeXtBlock(dim=dims[0], drop_path=dpr[cur + i]) 
@@ -371,53 +334,34 @@ class FrameEncoder(nn.Module):
             nn.Conv2d(dims[0], dims[1], kernel_size=2, stride=2)
         )
         
-        # ===== Stage 2: H/8, Hybrid (3 ConvNeXt + 3 Swin) =====
-        self.stage2_conv = nn.ModuleList([
+        # Stage 2: H/8 - Pure ConvNeXt
+        self.stage2 = nn.ModuleList([
             ConvNeXtBlock(dim=dims[1], drop_path=dpr[cur + i]) 
-            for i in range(3)
+            for i in range(depths[1])
         ])
-        cur += 3
-        self.stage2_swin = nn.ModuleList([
-            SwinTransformerBlock(
-                dim=dims[1], num_heads=6, window_size=7,
-                shift_size=0 if i % 2 == 0 else 3,
-                drop_path=dpr[cur + i]
-            ) for i in range(3)
-        ])
-        cur += 3
+        cur += depths[1]
         self.film2 = TemporalFiLM(dims[1], temporal_channels)
         self.downsample2 = nn.Sequential(
             LayerNorm(dims[1], eps=1e-6, data_format="channels_first"),
             nn.Conv2d(dims[1], dims[2], kernel_size=2, stride=2)
         )
         
-        # ===== Stage 3: H/16, Hybrid (3 ConvNeXt + 6 Swin) =====
-        self.stage3_conv = nn.ModuleList([
+        # Stage 3: H/16 - Pure ConvNeXt
+        self.stage3 = nn.ModuleList([
             ConvNeXtBlock(dim=dims[2], drop_path=dpr[cur + i]) 
-            for i in range(3)
+            for i in range(depths[2])
         ])
-        cur += 3
-        self.stage3_swin = nn.ModuleList([
-            SwinTransformerBlock(
-                dim=dims[2], num_heads=12, window_size=7,
-                shift_size=0 if i % 2 == 0 else 3,
-                drop_path=dpr[cur + i]
-            ) for i in range(6)
-        ])
-        cur += 6
+        cur += depths[2]
         self.film3 = TemporalFiLM(dims[2], temporal_channels)
         self.downsample3 = nn.Sequential(
             LayerNorm(dims[2], eps=1e-6, data_format="channels_first"),
             nn.Conv2d(dims[2], dims[3], kernel_size=2, stride=2)
         )
         
-        # ===== Stage 4: H/32, Pure Swin =====
+        # Stage 4: H/32 - Pure ConvNeXt
         self.stage4 = nn.ModuleList([
-            SwinTransformerBlock(
-                dim=dims[3], num_heads=24, window_size=7,
-                shift_size=0 if i % 2 == 0 else 3,
-                drop_path=dpr[cur + i]
-            ) for i in range(depths[3])
+            ConvNeXtBlock(dim=dims[3], drop_path=dpr[cur + i])
+            for i in range(depths[3])
         ])
         self.film4 = TemporalFiLM(dims[3], temporal_channels)
         
@@ -438,34 +382,30 @@ class FrameEncoder(nn.Module):
             f1, f2, f3, f4: Multi-scale features at [H/4, H/8, H/16, H/32]
         """
         # Stem
-        x = self.stem(frame)  # [B, 96, H/4, W/4]
+        x = self.stem(frame)
         
-        # Stage 1: Pure ConvNeXt
+        # Stage 1
         for block in self.stage1:
             x = block(x)
-        f1 = self.film1(x, temporal_encoding)  # [B, 96, H/4, W/4]
+        f1 = self.film1(x, temporal_encoding)
         x = self.downsample1(f1)
         
-        # Stage 2: ConvNeXt → Swin hybrid
-        for block in self.stage2_conv:
+        # Stage 2 - Pure ConvNeXt
+        for block in self.stage2:
             x = block(x)
-        for block in self.stage2_swin:
-            x = block(x)
-        f2 = self.film2(x, temporal_encoding)  # [B, 192, H/8, W/8]
+        f2 = self.film2(x, temporal_encoding)
         x = self.downsample2(f2)
         
-        # Stage 3: ConvNeXt → Swin hybrid (more Swin)
-        for block in self.stage3_conv:
+        # Stage 3 - Pure ConvNeXt
+        for block in self.stage3:
             x = block(x)
-        for block in self.stage3_swin:
-            x = block(x)
-        f3 = self.film3(x, temporal_encoding)  # [B, 384, H/16, W/16]
+        f3 = self.film3(x, temporal_encoding)
         x = self.downsample3(f3)
         
-        # Stage 4: Pure Swin
+        # Stage 4 - Pure ConvNeXt
         for block in self.stage4:
             x = block(x)
-        f4 = self.film4(x, temporal_encoding)  # [B, 768, H/32, W/32]
+        f4 = self.film4(x, temporal_encoding)
         
         return f1, f2, f3, f4
 
@@ -474,15 +414,15 @@ class FrameEncoder(nn.Module):
 # Progressive Decoder with Cross-Attention
 # ==========================
 
-class UpsampleStageWithCrossAttn(nn.Module):
+class UpsampleStage(nn.Module):
     """
     Single upsampling stage with:
     1. Upsample current features 2x
-    2. Cross-attention with skip connection
+    2. Concatenate with encoder skip connection (U-Net style)
     3. Fusion + Refinement with ConvNeXt blocks
     4. Temporal FiLM conditioning
     """
-    def __init__(self, in_dim, skip_dim, out_dim, num_heads, 
+    def __init__(self, in_dim, skip_dim, out_dim, 
                  num_refine_blocks=2, temporal_channels=65):
         super().__init__()
         
@@ -493,15 +433,7 @@ class UpsampleStageWithCrossAttn(nn.Module):
             LayerNorm(out_dim, eps=1e-6, data_format="channels_first")
         )
         
-        # Cross-attention: decoder queries encoder skip
-        self.cross_attn = CrossAttentionBlock(
-            query_dim=out_dim,
-            context_dim=skip_dim,
-            num_heads=num_heads,
-            dim_head=out_dim // num_heads
-        )
-        
-        # Fusion of upsampled + cross-attended features
+        # Fusion of upsampled + skip features
         self.fusion = nn.Sequential(
             nn.Conv2d(out_dim + skip_dim, out_dim, 1),
             LayerNorm(out_dim, eps=1e-6, data_format="channels_first"),
@@ -520,11 +452,13 @@ class UpsampleStageWithCrossAttn(nn.Module):
         # Upsample decoder features
         x_up = self.upsample(x)  # [B, out_dim, H, W]
         
-        # Cross-attend to encoder skip
-        x_attended = self.cross_attn(query=x_up, context=skip)  # [B, out_dim, H, W]
+        # Robust skip connection: resize skip to match x_up if needed
+        # This handles odd resolutions where H/2 * 2 != H
+        if skip.shape[-2:] != x_up.shape[-2:]:
+            skip = F.interpolate(skip, size=x_up.shape[-2:], mode='bilinear', align_corners=False)
         
-        # Fuse
-        x_fused = self.fusion(torch.cat([x_attended, skip], dim=1))
+        # Fuse (Concatenate)
+        x_fused = self.fusion(torch.cat([x_up, skip], dim=1))
         
         # Refine with ConvNeXt blocks
         for block in self.refine:
@@ -549,21 +483,22 @@ class DecoderTimeFiLM(nn.Module):
         temporal_channels_with_speed = temporal_channels
         
         # Upsampling stages (H/32 → H/16 → H/8 → H/4)
-        self.up1 = UpsampleStageWithCrossAttn(
+        # Upsampling stages (H/32 → H/16 → H/8 → H/4)
+        self.up1 = UpsampleStage(
             in_dim=768, skip_dim=384, out_dim=384,
-            num_heads=12, num_refine_blocks=2,
+            num_refine_blocks=2,
             temporal_channels=temporal_channels_with_speed
         )
         
-        self.up2 = UpsampleStageWithCrossAttn(
+        self.up2 = UpsampleStage(
             in_dim=384, skip_dim=192, out_dim=192,
-            num_heads=6, num_refine_blocks=2,
+            num_refine_blocks=2,
             temporal_channels=temporal_channels_with_speed
         )
         
-        self.up3 = UpsampleStageWithCrossAttn(
+        self.up3 = UpsampleStage(
             in_dim=192, skip_dim=96, out_dim=96,
-            num_heads=3, num_refine_blocks=2,
+            num_refine_blocks=2,
             temporal_channels=temporal_channels_with_speed
         )
         
