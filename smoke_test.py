@@ -34,7 +34,7 @@ if __name__ == "__main__":
     # 1) Interpolation (N=2): predict the middle
     # anchors: t0=0, t1=1 → target at 0.5
     # --------------------------
-    B, N, H, W = 1, 4, 768, 512 
+    B, N, H, W = 1, 4, 768, 768 
     frames = torch.rand(B, N, 3, H, W, device=device)
     anchor_times = torch.tensor([[0.0, 0.4, 0.8, 1.0]] * B, device=device)
     target_time = torch.tensor([0.5] * B, device=device)
