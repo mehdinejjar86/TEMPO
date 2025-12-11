@@ -540,7 +540,6 @@ def main():
     parser.add_argument("--temporal_channels", type=int, default=64)
     parser.add_argument("--encoder_depths", type=int, nargs='+', default=[3, 3, 9, 3])
     parser.add_argument("--decoder_depths", type=int, nargs='+', default=[3, 3, 3, 3])
-    parser.add_argument("--attn_heads", type=int, default=4)
     
     # Experiment
     parser.add_argument("--exp_name", type=str, default=None)
@@ -570,7 +569,6 @@ def main():
         temporal_channels=args.temporal_channels,
         encoder_depths=args.encoder_depths,
         decoder_depths=args.decoder_depths,
-        attn_heads=args.attn_heads,
         exp_name=args.exp_name,
         use_wandb=args.use_wandb,
         notes=args.notes,
