@@ -302,10 +302,10 @@ class TEMPOLoss(nn.Module):
         B, _, H, W = pred.shape
         N = frames.shape[1]
 
-        # Aux
+        # Aux - support both old (conf_map) and new (confidence) naming
         weights = aux.get("weights", torch.full((B, max(N, 1)), 1.0 / max(N, 1), device=device))
-        conf_map = aux.get("conf_map", torch.ones(B, 1, H, W, device=device)).to(dtype=pred.dtype)
-        attn_entropy = aux.get("attn_entropy", torch.zeros(B, 1, H, W, device=device)).to(dtype=pred.dtype)
+        conf_map = aux.get("confidence", aux.get("conf_map", torch.ones(B, 1, H, W, device=device))).to(dtype=pred.dtype)
+        attn_entropy = aux.get("entropy", aux.get("attn_entropy", torch.zeros(B, 1, H, W, device=device))).to(dtype=pred.dtype)
         fallback_mask = aux.get("fallback_mask", torch.zeros(B, device=device))
 
         # Scene-cut gate scalar per-sample → broadcast later (match pred dtype)
