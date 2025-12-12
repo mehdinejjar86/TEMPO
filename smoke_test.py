@@ -38,8 +38,8 @@ if __name__ == "__main__":
     model = build_tempo(
         base_channels=64,
         temporal_channels=64,
-        encoder_depths=[3, 3, 9, 3],
-        decoder_depths=[3, 3, 3, 3],
+        encoder_depths=[3, 3, 18, 3],
+        decoder_depths=[3, 3, 9, 3],
         attn_heads=4,
     ).to(device)
     model.train()
