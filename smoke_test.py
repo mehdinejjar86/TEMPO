@@ -50,7 +50,7 @@ if __name__ == "__main__":
     # 1) Interpolation (N=4): predict in the middle
     # --------------------------
     print("\n[Test 1] Interpolation with N=4 frames")
-    B, N, H, W = 1, 4, 768, 768
+    B, N, H, W = 1, 4, 512, 512
     frames = torch.rand(B, N, 3, H, W, device=device)
     anchor_times = torch.tensor([[0.0, 0.3, 0.7, 1.0]] * B, device=device)
     target_time = torch.tensor([0.5] * B, device=device)
