@@ -486,13 +486,15 @@ class NAFNetDecoder(nn.Module):
     Same interface as original DecoderTimeFiLM.
     
     Uses NAFNet blocks for maximum reconstruction quality (PSNR/SSIM).
+    Optionally predicts per-pixel uncertainty (log-variance) for heteroscedastic loss.
     """
     def __init__(
         self,
         base_channels: int = 64,
         temporal_channels: int = 64,
         depths: list = None,
-        drop_path_rate: float = 0.05
+        drop_path_rate: float = 0.05,
+        predict_uncertainty: bool = False,
     ):
         super().__init__()
         
@@ -548,6 +550,19 @@ class NAFNetDecoder(nn.Module):
             nn.Sigmoid()
         )
         
+        # Uncertainty head (predicts log-variance per pixel)
+        self.predict_uncertainty = predict_uncertainty
+        if predict_uncertainty:
+            self.uncertainty_head = nn.Sequential(
+                LayerNorm2d(C),
+                nn.Conv2d(C, C // 2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(C // 2, 1, kernel_size=3, padding=1),
+            )
+            # Initialize to predict low uncertainty (confident)
+            nn.init.zeros_(self.uncertainty_head[-1].weight)
+            nn.init.constant_(self.uncertainty_head[-1].bias, -2.0)  # exp(-2) ≈ 0.14
+        
         self._init_weights()
     
     def _init_weights(self):
@@ -602,6 +617,11 @@ class NAFNetDecoder(nn.Module):
         
         # To RGB
         out = self.to_rgb(x)
+        
+        # Uncertainty prediction (optional)
+        if self.predict_uncertainty:
+            log_var = self.uncertainty_head(x)
+            return out, log_var
         
         return out
 

@@ -6,7 +6,7 @@ from torch.optim import AdamW
 from torch.amp import autocast
 
 from model.tempo import build_tempo
-from model.loss.tempo_loss import tempo_loss
+from model.loss.tempo_loss import build_tempo_loss
 
 
 def grad_norm(model):
@@ -40,9 +40,13 @@ if __name__ == "__main__":
         temporal_channels=64,
         encoder_depths=[3, 3, 18, 3],
         decoder_depths=[3, 3, 9, 3],
-        attn_heads=4,
+        num_heads=4,
+        predict_uncertainty=True,
     ).to(device)
     model.train()
+
+    # Build loss function (with uncertainty)
+    loss_fn = build_tempo_loss(use_uncertainty=True).to(device)
 
     opt = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 
@@ -64,7 +68,9 @@ if __name__ == "__main__":
         print(f"  Weights: {aux['weights'][0].cpu().numpy().round(3)}")
         print(f"  Confidence: mean={aux['confidence'].mean():.3f}")
         print(f"  Entropy: mean={aux['entropy'].mean():.3f}")
-        loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
+        log_var = aux.get('log_var', None)
+        loss, logs = loss_fn(out, target_rgb, log_var=log_var, aux=aux, 
+                            anchor_times=anchor_times, target_time=target_time)
 
     loss.backward()
     gnorm = grad_norm(model)
@@ -89,7 +95,9 @@ if __name__ == "__main__":
         out, aux = model(frames, anchor_times, target_time)
         print(f"  Output: {out.shape}, dtype: {out.dtype}")
         print(f"  Weights: {aux['weights'][0].cpu().numpy().round(3)}")
-        loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
+        log_var = aux.get('log_var', None)
+        loss, logs = loss_fn(out, target_rgb, log_var=log_var, aux=aux,
+                            anchor_times=anchor_times, target_time=target_time)
 
     loss.backward()
     gnorm = grad_norm(model)
@@ -129,6 +137,10 @@ if __name__ == "__main__":
     print(f"  Fusion (CrossAttention): {fus_params:.2f}M")
     print(f"  Decoder (NAFNet):        {dec_params:.2f}M")
     print(f"  Total:                   {total_params:.2f}M")
+    
+    # Loss function parameters (learnable uncertainty weights)
+    loss_params = sum(p.numel() for p in loss_fn.parameters())
+    print(f"  Loss (learnable):        {loss_params} params")
 
     print("\n" + "="*60)
     print("✅ All tests passed!")

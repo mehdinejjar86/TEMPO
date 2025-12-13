@@ -52,6 +52,7 @@ class TEMPO(nn.Module):
         # Decoder
         decoder_depths: list = None,
         decoder_drop_path: float = 0.05,
+        predict_uncertainty: bool = False,
         # Fusion
         num_heads: int = 8,
         num_points: int = 4,
@@ -98,8 +99,10 @@ class TEMPO(nn.Module):
             base_channels=C,
             temporal_channels=Ct + 1,
             depths=decoder_depths,
-            drop_path_rate=decoder_drop_path
+            drop_path_rate=decoder_drop_path,
+            predict_uncertainty=predict_uncertainty,
         )
+        self.predict_uncertainty = predict_uncertainty
     
     def _compute_speed_token(self, anchor_times: torch.Tensor, target_time: torch.Tensor) -> torch.Tensor:
         """Speed token: temporal density indicator."""
@@ -197,7 +200,14 @@ class TEMPO(nn.Module):
         speed = self._compute_speed_token(anchor_times, target_time)
         tgt_enc_with_speed = torch.cat([tgt_enc, speed], dim=-1)
         
-        output = self.decoder(f1, f2, f3, f4, tgt_enc_with_speed)
+        decoder_out = self.decoder(f1, f2, f3, f4, tgt_enc_with_speed)
+        
+        # Handle uncertainty output from decoder
+        if isinstance(decoder_out, tuple):
+            output, log_var = decoder_out
+        else:
+            output = decoder_out
+            log_var = None
         
         # =====================================================================
         # 7. AUX OUTPUTS
@@ -206,6 +216,7 @@ class TEMPO(nn.Module):
             "weights": weights.detach(),
             "confidence": confidence.detach(),
             "entropy": entropy.detach(),
+            "log_var": log_var,  # For heteroscedastic loss
             "prior_alpha": prior_info["alpha"],
             "prior_bimix": prior_info["bimix"],
         }
@@ -222,6 +233,7 @@ def build_tempo(
     temporal_channels: int = 64,
     encoder_depths: list = None,
     decoder_depths: list = None,
+    predict_uncertainty: bool = False,
     # Fusion settings
     num_heads: int = 8,
     num_points: int = 4,
@@ -263,6 +275,7 @@ def build_tempo(
         temporal_channels=temporal_channels,
         encoder_depths=encoder_depths,
         decoder_depths=decoder_depths,
+        predict_uncertainty=predict_uncertainty,
         num_heads=num_heads,
         num_points=num_points,
         use_cross_scale=use_cross_scale,
