@@ -210,7 +210,16 @@ class TEMPO(nn.Module):
             log_var = None
         
         # =====================================================================
-        # 7. AUX OUTPUTS
+        # 7. SKIP CONNECTION FROM INPUT BLEND
+        # =====================================================================
+        # Critical: Without this, AdaLN-Zero gates start at 0, blocking gradients.
+        # Blend input frames as initialization, model learns the residual.
+        input_blend = (frames * weights.view(B, N, 1, 1, 1)).sum(dim=1)  # [B, 3, H, W]
+        output = output + input_blend  # Residual learning
+        output = output.clamp(0, 1)  # Keep in valid range
+        
+        # =====================================================================
+        # 8. AUX OUTPUTS
         # =====================================================================
         aux = {
             "weights": weights.detach(),
