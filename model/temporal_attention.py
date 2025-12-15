@@ -58,16 +58,53 @@ class SinusoidalTimeEncoding(nn.Module):
 # Deformable Temporal Attention
 # ==============================================================================
 
+class UpdateBlock(nn.Module):
+    """
+    GRU-based update block for iterative offset refinement.
+    Predicts delta_offset and delta_attn from current state.
+    """
+    def __init__(self, hidden_dim: int, input_dim: int, head_dim: int, num_points: int):
+        super().__init__()
+        self.gru = nn.GRUCell(input_dim, hidden_dim)
+        self.head_dim = head_dim
+        self.num_points = num_points
+        
+        # Output prediction heads
+        self.to_delta_offset = nn.Linear(hidden_dim, num_points * 2)
+        self.to_delta_attn = nn.Linear(hidden_dim, num_points)
+        
+        # Initialize
+        nn.init.zeros_(self.to_delta_offset.weight)
+        nn.init.zeros_(self.to_delta_offset.bias)
+        nn.init.zeros_(self.to_delta_attn.weight)
+        nn.init.zeros_(self.to_delta_attn.bias)
+
+    def forward(self, net: torch.Tensor, inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            net: [B*heads*H*W, hidden] hidden state
+            inp: [B*heads*H*W, input_dim] input features (sampled values, correlation, etc)
+        Returns:
+            net: updated hidden state
+            delta_offset: [B*heads, H, W, points, 2]
+            delta_attn: [B*heads, H, W, points]
+        """
+        net = self.gru(inp, net)
+        
+        delta_offset = self.to_delta_offset(net)
+        delta_attn = self.to_delta_attn(net)
+        
+        return net, delta_offset, delta_attn
+
+
 class DeformableTemporalAttention(nn.Module):
     """
-    High-performance temporal attention with deformable sampling.
+    High-performance temporal attention with iterative offset refinement.
     
-    For each query position:
-      1. Predict WHERE to sample in each observation (deformable offsets)
-      2. Predict HOW MUCH to weight each observation (attention)
-      3. Both are conditioned on temporal distance
-    
-    This is "implicit motion" — the offsets learn to track content across time.
+    Features:
+      1. Correlation Peak Initialization: Uses cost volume to find initial motion.
+      2. Iterative Refinement: GRU-based loop refines offsets (3 iterations).
+      3. Deformable Sampling: Samples features at refined locations.
     """
     def __init__(
         self,
@@ -76,6 +113,7 @@ class DeformableTemporalAttention(nn.Module):
         num_heads: int = 8,
         num_points: int = 4,
         dropout: float = 0.0,
+        num_iters: int = 3,  # Number of refinement iterations
     ):
         super().__init__()
         assert channels % num_heads == 0
@@ -85,46 +123,41 @@ class DeformableTemporalAttention(nn.Module):
         self.num_heads = num_heads
         self.num_points = num_points
         self.head_dim = channels // num_heads
+        self.num_iters = num_iters
         
         # =====================
-        # Query pathway
+        # Feature Extractors
         # =====================
         self.q_proj = nn.Conv2d(channels, channels, 1)
+        self.v_proj = nn.Conv2d(channels, channels, 1)
         
-        # =====================
-        # Offset prediction (WHERE to look)
-        # Time-conditioned: offset depends on temporal distance
-        # =====================
-        self.offset_net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),  # Spatial context
+        # Context extraction for UpdateBlock
+        self.cnet = nn.Sequential(
+            nn.Conv2d(channels, channels, 7, padding=3, groups=channels),
             nn.GELU(),
-            nn.Conv2d(channels, channels // 2, 1),
-            nn.GELU(),
-            nn.Conv2d(channels // 2, num_heads * num_points * 2, 1),
-        )
-        
-        # Time modulates offsets (larger dt → larger search range)
-        self.time_to_offset_scale = nn.Sequential(
-            nn.Linear(temporal_channels, num_heads * num_points),
-            nn.Softplus(),
+            nn.Conv2d(channels, channels, 1)
         )
         
         # =====================
-        # Attention prediction (HOW MUCH to weight)
+        # Iterative Update Components
         # =====================
-        self.attn_net = nn.Sequential(
-            nn.Conv2d(channels, channels // 2, 1),
-            nn.GELU(),
-            nn.Conv2d(channels // 2, num_heads * num_points, 1),
+        # Input to GRU: [Sampled Features + Correlation info + Motion features]
+        # For simplicity, we feed: [Head Features (head_dim) + Current Offset (2)]
+        input_dim = self.head_dim + 2
+        hidden_dim = self.head_dim
+        
+        self.update_block = UpdateBlock(
+            hidden_dim=hidden_dim, 
+            input_dim=input_dim, 
+            head_dim=self.head_dim, 
+            num_points=num_points
         )
         
+        # =====================
+        # Time Modulation
+        # =====================
         # Time bias for attention (closer observations → higher weight)
         self.time_to_attn_bias = nn.Linear(temporal_channels, num_heads)
-        
-        # =====================
-        # Value pathway
-        # =====================
-        self.v_proj = nn.Conv2d(channels, channels, 1)
         
         # =====================
         # Output
@@ -135,173 +168,210 @@ class DeformableTemporalAttention(nn.Module):
             nn.Conv2d(channels, channels, 1),
         )
         
-        # Gate for residual (learned, starts at 0)
         self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         
         self._init_weights()
     
     def _init_weights(self):
-        # Offsets start at zero (identity sampling)
-        nn.init.zeros_(self.offset_net[-1].weight)
-        nn.init.zeros_(self.offset_net[-1].bias)
-        
-        # Attention starts uniform
-        nn.init.zeros_(self.attn_net[-1].weight)
-        nn.init.zeros_(self.attn_net[-1].bias)
-        
-        # Output projection
         nn.init.xavier_uniform_(self.out_proj[0].weight)
         nn.init.zeros_(self.out_proj[-1].weight)
         nn.init.zeros_(self.out_proj[-1].bias)
-    
+
+    def _compute_correlation(self, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Compute local correlation volume to initialize offsets.
+        Result: Best matching offset among 5 local neighbors (0,0), (+1,0), (-1,0), etc.
+        """
+        B, heads, C, H, W = q.shape
+        device = q.device
+        
+        # 5 search points: Center, Left, Right, Up, Down
+        # Shifts in (dx, dy)
+        shifts = [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]
+        offset_vals = torch.tensor(shifts, device=device, dtype=torch.float32) # [5, 2]
+        
+        # We compute dot product <q, v_shifted>
+        # q: [B, heads, C, H, W]
+        # v: [B, heads, C, H, W] assuming v is the "nearest neighbor" observation passed in context?
+        # Actually _compute_correlation is called with v=? 
+        # In current init, we don't call it yet. Let's fix usage in Forward too if needed.
+        # But providing the capability is key.
+        
+        scores = []
+        for dx, dy in shifts:
+            # Shift v
+            v_shifted = torch.roll(v, shifts=(dy, dx), dims=(-2, -1))
+            
+            # Zero out rolled-over parts (simple padding emulation)
+            if dy > 0: v_shifted[..., :dy, :] = 0
+            if dy < 0: v_shifted[..., dy:, :] = 0
+            if dx > 0: v_shifted[..., :, :dx] = 0
+            if dx < 0: v_shifted[..., :, dx:] = 0
+            
+            # Dot product
+            score = (q * v_shifted).sum(dim=2) # [B, heads, H, W]
+            scores.append(score)
+            
+        scores = torch.stack(scores, dim=-1) # [B, heads, H, W, 5]
+        best_idx = scores.argmax(dim=-1) # [B, heads, H, W]
+        
+        # Convert index to offset vector
+        # offset_vals: [5, 2]
+        pad = max(H, W) # Normalize to [-1, 1] range? 
+        # Offsets in grid_sample are normalized to [-1, 1]. 
+        # 1 pixel = 2/H or 2/W
+        scale_y = 2.0 / H
+        scale_x = 2.0 / W
+        
+        # Gather best offsets
+        # Use simple indexing since 5 is small
+        out_offsets = torch.zeros(B, heads, H, W, 2, device=device)
+        
+        # This loop is slow but fine for logic demonstration. 
+        # Vectorized gather is better:
+        best_off = offset_vals[best_idx] # [B, heads, H, W, 2]
+        
+        # Scale to normalized coordinates
+        out_offsets[..., 0] = best_off[..., 1] * scale_x # x is dim 1 in offsets
+        out_offsets[..., 1] = best_off[..., 0] * scale_y # y is dim 0 in shifts
+        
+        return out_offsets
+
     def forward(
         self,
-        query: torch.Tensor,          # [B, C, H, W] - target features
-        values: torch.Tensor,         # [B, N, C, H, W] - observation features
-        rel_time: torch.Tensor,       # [B, N] - relative time (normalized)
-        time_enc: torch.Tensor,       # [B, N, Ct] - time encodings
+        query: torch.Tensor,          # [B, C, H, W]
+        values: torch.Tensor,         # [B, N, C, H, W]
+        rel_time: torch.Tensor,       # [B, N]
+        time_enc: torch.Tensor,       # [B, N, Ct]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            output: [B, C, H, W] - fused features (residual-ready)
-            confidence: [B, 1, H, W] - per-pixel confidence
-            entropy: [B, 1, H, W] - attention entropy
-        """
+        
         B, C, H, W = query.shape
         N = values.shape[1]
         device = query.device
-        dtype = query.dtype
         
-        # Project query
-        q = self.q_proj(query)  # [B, C, H, W]
+        # 1. Project features
+        q = self.q_proj(query)             # [B, C, H, W]
+        v = self.v_proj(values.view(-1, C, H, W)).view(B, N, C, H, W)
         
-        # Predict base offsets from query features
-        base_offsets = self.offset_net(q)  # [B, heads*points*2, H, W]
-        base_offsets = base_offsets.view(B, self.num_heads, self.num_points, 2, H, W)
-        base_offsets = base_offsets.permute(0, 1, 2, 4, 5, 3)  # [B, heads, points, H, W, 2]
+        # Reshape to heads: [B, heads, head_dim, H, W]
+        q_heads = q.view(B, self.num_heads, self.head_dim, H, W)
+        v_heads = v.view(B, N, self.num_heads, self.head_dim, H, W)
         
-        # Predict base attention logits
-        base_attn = self.attn_net(q)  # [B, heads*points, H, W]
-        base_attn = base_attn.view(B, self.num_heads, self.num_points, H, W)
-        base_attn = base_attn.permute(0, 1, 3, 4, 2)  # [B, heads, H, W, points]
+        # 2. Extract Context (Hidden State for GRU)
+        net = self.cnet(query)             # [B, C, H, W]
+        # Flatten for GRU: [B*heads*H*W, head_dim]
+        net = net.view(B, self.num_heads, self.head_dim, H, W).permute(0, 1, 3, 4, 2).reshape(-1, self.head_dim)
         
-        # Build sampling grid (normalized to [-1, 1])
+        # 3. Initialization
+        # Find nearest neighbor for initialization
+        nearest_idx = rel_time.abs().argmin(dim=1) # [B]
+        v_nearest = torch.stack([v_heads[b, nearest_idx[b]] for b in range(B)], dim=0) # [B, heads, head_dim, H, W]
+        
+        # Compute correlation-based offset
+        # q_heads: [B, heads, head_dim, H, W]
+        best_offset = self._compute_correlation(q_heads, v_nearest) # [B, heads, H, W, 2]
+        
+        # Initialize coords with specific correlation peak
+        # Expand across points? For now, all points start at the correlation peak
+        coords_init = best_offset.unsqueeze(4).repeat(1, 1, 1, 1, self.num_points, 1) # [B, heads, H, W, points, 2]
+        
+        attn_logits = torch.zeros(B, self.num_heads, H, W, N, self.num_points, device=device)
+        
+        # Base Grid
         grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=device, dtype=dtype),
-            torch.linspace(-1, 1, W, device=device, dtype=dtype),
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
             indexing='ij'
         )
-        base_grid = torch.stack([grid_x, grid_y], dim=-1)  # [H, W, 2]
+        base_grid = torch.stack([grid_x, grid_y], dim=-1) # [H, W, 2]
         
-        # Process each observation
-        all_samples = []  # Will be [B, N, heads, H, W, points, head_dim]
-        all_attn_logits = []  # Will be [B, N, heads, H, W, points]
+        # 4. Iterative Loop
+        curr_offsets = coords_init # [B, heads, H, W, points, 2]
+        curr_attn = attn_logits    # [B, heads, H, W, N, points]
         
-        for n in range(N):
-            # Time encoding for this observation
-            t_enc = time_enc[:, n]  # [B, Ct]
-            t_rel = rel_time[:, n]  # [B]
-            
-            # Scale offsets by temporal distance (larger dt → look further)
-            offset_scale = self.time_to_offset_scale(t_enc)  # [B, heads*points]
-            offset_scale = offset_scale.view(B, self.num_heads, self.num_points, 1, 1, 1)
-            offset_scale = 0.5 + offset_scale  # Base scale of 0.5, can grow
-            
-            # Scale offsets by temporal distance magnitude
-            dt_magnitude = t_rel.abs().view(B, 1, 1, 1, 1, 1)
-            scaled_offsets = base_offsets * offset_scale * (1.0 + dt_magnitude)
-            
-            # Clamp offsets to reasonable range
-            scaled_offsets = scaled_offsets.clamp(-1.0, 1.0)
-            
-            # Attention bias from time (closer → higher attention)
-            attn_bias = self.time_to_attn_bias(t_enc)  # [B, heads]
-            attn_bias = attn_bias.view(B, self.num_heads, 1, 1, 1)
-            
-            # Distance penalty (fundamental, always prefer closer)
-            dist_penalty = -t_rel.abs().view(B, 1, 1, 1, 1) * 2.0
-            
-            # Biased attention logits for this observation
-            attn_n = base_attn + attn_bias + dist_penalty  # [B, heads, H, W, points]
-            all_attn_logits.append(attn_n)
-            
-            # Project values for this observation
-            v_n = self.v_proj(values[:, n])  # [B, C, H, W]
-            v_n = v_n.view(B, self.num_heads, self.head_dim, H, W)
-            
-            # Sample at each point
-            samples_n = []
-            for p in range(self.num_points):
-                # Sampling grid for this point
-                offset_p = scaled_offsets[:, :, p]  # [B, heads, H, W, 2]
-                
-                # For each head, sample from values
-                head_samples = []
-                for h in range(self.num_heads):
-                    grid_h = base_grid + offset_p[:, h]  # [B, H, W, 2]
-                    grid_h = grid_h.clamp(-1, 1)
-                    
-                    # Sample
-                    padding_mode = "zeros" if torch.torch.backends.mps.is_available() else "border"
-                    sampled = F.grid_sample(
-                        v_n[:, h],  # [B, head_dim, H, W]
-                        grid_h,
-                        mode='bilinear',
-                        padding_mode=padding_mode,
-                        align_corners=True
-                    )  # [B, head_dim, H, W]
-                    head_samples.append(sampled)
-                
-                # Stack heads: [B, heads, head_dim, H, W]
-                head_samples = torch.stack(head_samples, dim=1)
-                samples_n.append(head_samples)
-            
-            # Stack points: [B, heads, points, head_dim, H, W]
-            samples_n = torch.stack(samples_n, dim=2)
-            samples_n = samples_n.permute(0, 1, 4, 5, 2, 3)  # [B, heads, H, W, points, head_dim]
-            all_samples.append(samples_n)
+        for i in range(self.num_iters):
+             # 4a. Sample features at current offsets
+             # Use v_nearest (cached)
+             # Sample from nearest neighbor at current point 0
+             p0_offset = curr_offsets[..., 0, :] # [B, heads, H, W, 2]
+             
+             sample_grid = base_grid.view(1, 1, H, W, 2) + p0_offset
+             sample_grid = sample_grid.view(B*self.num_heads, H, W, 2).clamp(-1, 1)
+             
+             # Flatten v_nearest for grid_sample
+             v_flat = v_nearest.view(B*self.num_heads, self.head_dim, H, W)
+             
+             padding_mode = "zeros" if torch.torch.backends.mps.is_available() else "border"
+             sampled_feat = F.grid_sample(v_flat, sample_grid, align_corners=True, padding_mode=padding_mode) # [B*h, C/h, H, W]
+             
+             # Input to GRU: [Sampled Features (C/h) + Current Offset (2)]
+             sampled_feat = sampled_feat.permute(0, 2, 3, 1).reshape(-1, self.head_dim)
+             offset_feat = p0_offset.view(-1, 2)
+             
+             gru_in = torch.cat([sampled_feat, offset_feat], dim=-1)
+             
+             # 4b. Update State
+             net, delta_offset_flat, delta_attn_flat = self.update_block(net, gru_in)
+             
+             # 4c. Apply Updates
+             # delta_offset: [B*heads*H*W, points*2] -> [B, heads, H, W, points, 2]
+             d_offset = delta_offset_flat.view(B, self.num_heads, H, W, self.num_points, 2)
+             curr_offsets = curr_offsets + d_offset
+             
+             # delta_attn: [B*heads*H*W, points] -> [B, heads, H, W, points] (shared across N)
+             d_attn = delta_attn_flat.view(B, self.num_heads, H, W, self.num_points)
+             # Expand to N (global bias update)
+             curr_attn = curr_attn + d_attn.unsqueeze(4)
+
+        # 5. Final Sampling & Aggregation
+        # Normalize weights
+        # Time bias
+        # t_enc: [B, N, Ct]
+        # bias: [B, N, heads]
+        t_bias = self.time_to_attn_bias(time_enc).permute(0, 2, 1).view(B, self.num_heads, 1, 1, N, 1)
         
-        # Stack observations: [B, N, heads, H, W, points, head_dim]
-        all_samples = torch.stack(all_samples, dim=1)
-        
-        # Stack attention: [B, N, heads, H, W, points]
-        all_attn_logits = torch.stack(all_attn_logits, dim=1)
-        
-        # Softmax over (observations × points)
-        attn_shape = all_attn_logits.shape
-        all_attn_flat = all_attn_logits.view(B, N * self.num_heads, H, W, self.num_points)
-        all_attn_flat = all_attn_flat.view(B, -1, H, W, self.num_points)
-        
-        # Reshape for softmax over N*points
-        all_attn_logits = all_attn_logits.permute(0, 2, 3, 4, 1, 5)  # [B, heads, H, W, N, points]
-        all_attn_logits = all_attn_logits.reshape(B, self.num_heads, H, W, N * self.num_points)
-        attn_weights = F.softmax(all_attn_logits, dim=-1)  # [B, heads, H, W, N*points]
+        final_attn = curr_attn + t_bias
+        attn_weights = F.softmax(final_attn.view(B, self.num_heads, H, W, -1), dim=-1)
+        attn_weights = attn_weights.view(B, self.num_heads, H, W, N, self.num_points)
         attn_weights = self.dropout(attn_weights)
         
-        # Compute entropy for confidence
-        entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1)  # [B, heads, H, W]
-        entropy = entropy.mean(dim=1, keepdim=True).unsqueeze(1)  # [B, 1, 1, H, W]
-        entropy = entropy.squeeze(2)  # [B, 1, H, W]
+        # Sample all
+        all_samples = []
+        for n in range(N):
+            samples_n = []
+            for p in range(self.num_points):
+                off = curr_offsets[..., p, :] # [B, heads, H, W, 2]
+                grid = base_grid.view(1, 1, H, W, 2) + off
+                grid = grid.view(B*self.num_heads, H, W, 2).clamp(-1, 1)
+                
+                v_n = v_heads[:, n].reshape(B*self.num_heads, self.head_dim, H, W)
+                s = F.grid_sample(v_n, grid, align_corners=True, padding_mode=padding_mode)
+                samples_n.append(s.view(B, self.num_heads, self.head_dim, H, W))
+            all_samples.append(torch.stack(samples_n, dim=-1)) # [B, h, d, H, W, p]
+
+        # Stack: [B, N, h, d, H, W, p]
+        all_samples = torch.stack(all_samples, dim=1)
         
-        # Reshape attention weights back
-        attn_weights = attn_weights.view(B, self.num_heads, H, W, N, self.num_points)
-        attn_weights = attn_weights.permute(0, 4, 1, 2, 3, 5)  # [B, N, heads, H, W, points]
+        # Weighted sum
+        # attn: [B, h, H, W, N, p]
+        # samples: [B, N, h, d, H, W, p] -> permute to match
+        all_samples = all_samples.permute(0, 2, 4, 5, 1, 6, 3) # [B, h, H, W, N, p, d]
         
-        # Weighted sum of samples
-        # all_samples: [B, N, heads, H, W, points, head_dim]
-        # attn_weights: [B, N, heads, H, W, points]
-        output = (all_samples * attn_weights.unsqueeze(-1)).sum(dim=(1, 5))  # [B, heads, H, W, head_dim]
-        output = output.permute(0, 1, 4, 2, 3)  # [B, heads, head_dim, H, W]
-        output = output.reshape(B, C, H, W)
+        output = (all_samples * attn_weights.unsqueeze(-1)).sum(dim=(4, 5)) # [B, h, H, W, d]
+        output = output.permute(0, 1, 4, 2, 3).reshape(B, C, H, W)
         
-        # Output projection with gating
         output = self.out_proj(output) * torch.sigmoid(self.gate)
         
-        # Confidence from entropy (low entropy = high confidence)
+        # Real confidence statistics
+        # Entropy of the attention distribution (over N*points)
+        att_flat = attn_weights.view(B, self.num_heads, H, W, -1)
+        entropy = -(att_flat * (att_flat + 1e-8).log()).sum(dim=-1) # [B, heads, H, W]
+        entropy = entropy.mean(dim=1, keepdim=True) # [B, 1, H, W]
+        
+        # Confidence = 1 - normalized_entropy
         max_entropy = math.log(N * self.num_points)
-        confidence = 1.0 - (entropy / max_entropy).clamp(0, 1)
+        confidence = 1.0 - (entropy / (max_entropy + 1e-8)).clamp(0, 1)
         
         return output, confidence, entropy
 

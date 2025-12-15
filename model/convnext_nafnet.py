@@ -507,9 +507,10 @@ class NAFNetDecoder(nn.Module):
         # Decoder goes from deep (C*8) to shallow (C)
         
         # Stage 4 → 3: 1/8× → 1/4×
+        # PixelShuffle: Input C*8, Output C*4. Needs C*4 * 4 channels pre-shuffle.
         self.up4 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(C * 8, C * 4, kernel_size=1)
+            nn.Conv2d(C * 8, C * 4 * 4, kernel_size=1),
+            nn.PixelShuffle(2)
         )
         self.merge4 = nn.Conv2d(C * 4 + C * 4, C * 4, kernel_size=1)  # Skip connection
         self.blocks4 = nn.ModuleList([
@@ -518,9 +519,10 @@ class NAFNetDecoder(nn.Module):
         ])
         
         # Stage 3 → 2: 1/4× → 1/2×
+        # PixelShuffle: Input C*4, Output C*2. Needs C*2 * 4 channels pre-shuffle.
         self.up3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(C * 4, C * 2, kernel_size=1)
+            nn.Conv2d(C * 4, C * 2 * 4, kernel_size=1),
+            nn.PixelShuffle(2)
         )
         self.merge3 = nn.Conv2d(C * 2 + C * 2, C * 2, kernel_size=1)
         self.blocks3 = nn.ModuleList([
@@ -529,9 +531,10 @@ class NAFNetDecoder(nn.Module):
         ])
         
         # Stage 2 → 1: 1/2× → 1×
+        # PixelShuffle: Input C*2, Output C. Needs C * 4 channels pre-shuffle.
         self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(C * 2, C, kernel_size=1)
+            nn.Conv2d(C * 2, C * 4, kernel_size=1),
+            nn.PixelShuffle(2)
         )
         self.merge2 = nn.Conv2d(C + C, C, kernel_size=1)
         self.blocks2 = nn.ModuleList([
@@ -547,8 +550,10 @@ class NAFNetDecoder(nn.Module):
         self.to_rgb = nn.Sequential(
             LayerNorm2d(C),
             nn.Conv2d(C, 3, kernel_size=3, padding=1),
-            nn.Sigmoid()
         )
+        # Zero-init output for residual learning (starts as identity)
+        nn.init.zeros_(self.to_rgb[-1].weight)
+        nn.init.zeros_(self.to_rgb[-1].bias)
         
         # Uncertainty head (predicts log-variance per pixel)
         self.predict_uncertainty = predict_uncertainty
@@ -565,12 +570,41 @@ class NAFNetDecoder(nn.Module):
         
         self._init_weights()
     
+    def _icnr_init(self, tensor, scale_factor=2, initializer=nn.init.kaiming_normal_):
+        """
+        ICNR initialization for checkerboard artifact free sub-pixel convolution
+        Ref: https://arxiv.org/abs/1707.02937
+        """
+        # Tensor is [OutCh, InCh, KH, KW]
+        # For 1x1 conv, KH=KW=1
+        vocab_size, hidden_size, _, _ = tensor.shape
+        # Output channels = TargetCh * scale^2
+        target_ch = vocab_size // (scale_factor ** 2)
+        
+        # We initialize a kernel of size [TargetCh, InCh, KH, KW]
+        kernel = torch.zeros(target_ch, hidden_size, *tensor.shape[2:])
+        initializer(kernel)
+        
+        # Then repeat it scale^2 times to fill the vocab_size
+        kernel = kernel.repeat(scale_factor ** 2, 1, 1, 1)
+        
+        return kernel
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Apply ICNR to PixelShuffle stats
+        # The conv before PixelShuffle is the first item in the sequential
+        if hasattr(self, 'up4'):
+            self.up4[0].weight.data.copy_(self._icnr_init(self.up4[0].weight.data))
+        if hasattr(self, 'up3'):
+            self.up3[0].weight.data.copy_(self._icnr_init(self.up3[0].weight.data))
+        if hasattr(self, 'up2'):
+            self.up2[0].weight.data.copy_(self._icnr_init(self.up2[0].weight.data))
     
     def forward(
         self,

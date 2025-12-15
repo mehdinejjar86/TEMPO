@@ -28,17 +28,18 @@ TEMPO (Temporal View Synthesis):
 | Feature | Description |
 |---------|-------------|
 | **Temporal View Synthesis** | Treats frames as temporal observations, not sources for pixel warping |
-| **Arbitrary N-Frame Input** | Supports 2, 4, 8+ input frames—more observations = better synthesis |
-| **Continuous Timestamps** | Interpolate or extrapolate to any point in time |
-| **Deformable Temporal Attention** | Correlation-guided offsets for implicit motion handling |
-| **Cross-Scale Guidance** | Coarse-to-fine refinement prevents hallucination artifacts |
-| **Uncertainty-Aware Loss** | Learnable task weighting + pixel-level confidence |
+| **Iterative Motion Refinement** | GRU-based iterative loop (3 steps) locks onto complex motion |
+| **Correlation-Guided Init** | Local cost-volume search initializes offsets (no cold start) |
+| **PixelShuffle Upsampling** | Generative upsampling (ICNR initialized) for maximum sharpness |
+| **Arbitrary N-Input** | Supports any number of input frames (2, 4, 8+) |
+| **Continuous Time** | Interpolate or extrapolate to any floating-point timestamp |
+| **Uncertainty-Aware** | Predicts pixel-level confidence maps to guide loss weighting |
 
-## Architecture
+## Architecture (TEMPO v2)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         TEMPO Architecture                       │
+│                    TEMPO v2 High-Performance                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  Input: N frames [B, N, 3, H, W] + timestamps [B, N]            │
@@ -50,25 +51,28 @@ TEMPO (Temporal View Synthesis):
 │  └─────────────────────────────────────────────────────────┘    │
 │                           ↓                                      │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │           Deformable Temporal Attention                  │    │
-│  │   • Correlation Pyramid (4-level feature matching)       │    │
-│  │   • Learned offsets per head × points                   │    │
-│  │   • Scaled by temporal distance |Δt|                    │    │
+│  │        Iterative Deformable Temporal Attention           │    │
+│  │   1. Correlation Search (Local Cost Volume)              │    │
+│  │   2. GRU Update Block (3 Iterations)                     │    │
+│  │      • Refines offsets (Where to look)                   │    │
+│  │      • Refines attention (How much to trust)             │    │
+│  │   3. Deformable Sampling (Grid Sample)                   │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                           ↓                                      │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │              Cross-Scale Guidance                        │    │
-│  │         8C → 4C → 2C → C (coarse-to-fine)               │    │
+│  │              Cross-Scale Refinement                      │    │
+│  │         Coarse predictions guide fine features           │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                           ↓                                      │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │               NAFNet Decoder                             │    │
-│  │         Skip connections + uncertainty prediction        │    │
+│  │         PixelShuffle Upsampling (ICNR Init)              │    │
+│  │         AdaLN-Zero Conditioning                          │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                           ↓                                      │
-│  Output: Synthesized frame [B, 3, H, W] + confidence map        │
+│  Output: Synthesized frame [B, 3, H, W] + Uncertainty Map       │
 │                                                                  │
-│  Total Parameters: ~25M                                          │
+│  Total Parameters: ~27M                                          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
