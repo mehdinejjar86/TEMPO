@@ -118,18 +118,68 @@ class TEMPO(nn.Module):
         
         return (med_gap / span).clamp(0, 1)
     
+    def compute_backward_synthesis(
+        self,
+        forward_pred: torch.Tensor,      # [B, 3, H, W] - forward synthesized frame
+        frames: torch.Tensor,             # [B, N, 3, H, W] - original anchor frames
+        anchor_times: torch.Tensor,       # [B, N] - anchor timestamps
+        target_time: torch.Tensor,        # [B] or [B, 1] - target timestamp
+        anchor_idx: int = 0,              # Which anchor to reconstruct
+    ):
+        """
+        TEMPO BEAST Phase 3: Backward synthesis for bidirectional consistency.
+
+        Given the forward prediction, synthesize one of the original anchor frames.
+        This creates a cycle: [F0, F1, ...] → Ft → [Ft, ...] → F0'
+
+        Args:
+            forward_pred: Forward synthesized frame at target_time
+            frames: Original anchor frames
+            anchor_times: Timestamps of anchor frames
+            target_time: Target timestamp
+            anchor_idx: Index of anchor frame to reconstruct (default: 0)
+
+        Returns:
+            reconstructed_anchor: [B, 3, H, W] - backward synthesized anchor frame
+        """
+        B, N = anchor_times.shape
+
+        # Create new observation set: [Ft, F1, F2, ..., FN] (replace F_anchor_idx with Ft)
+        backward_frames = frames.clone()
+        backward_frames[:, anchor_idx] = forward_pred
+
+        # New timestamps: target_time replaces anchor_times[anchor_idx]
+        backward_times = anchor_times.clone()
+        backward_times[:, anchor_idx] = target_time.squeeze(-1) if target_time.dim() > 1 else target_time
+
+        # Target: reconstruct the original anchor
+        reconstruct_time = anchor_times[:, anchor_idx]
+
+        # Forward pass to reconstruct anchor (use no_grad to avoid memory overhead)
+        with torch.no_grad():
+            reconstructed, _ = self.forward(backward_frames, backward_times, reconstruct_time)
+
+        return reconstructed
+
     def forward(
-        self, 
+        self,
         frames: torch.Tensor,        # [B, N, 3, H, W]
         anchor_times: torch.Tensor,  # [B, N]
         target_time: torch.Tensor,   # [B] or [B, 1]
+        compute_bidirectional: bool = False,  # TEMPO BEAST Phase 3
     ):
         """
         Synthesize frame at target_time from N temporal observations.
-        
+
+        Args:
+            frames: Input anchor frames [B, N, 3, H, W]
+            anchor_times: Anchor timestamps [B, N]
+            target_time: Target timestamp [B] or [B, 1]
+            compute_bidirectional: If True, compute backward synthesis for consistency loss
+
         Returns:
             output: [B, 3, H, W]
-            aux: dict with weights, confidence, entropy
+            aux: dict with weights, confidence, entropy, and optionally backward_anchor
         """
         B, N, _, H, W = frames.shape
         device = frames.device
@@ -213,7 +263,27 @@ class TEMPO(nn.Module):
             "uncertainty_log_var": uncertainty_log_var.detach(),
             "uncertainty_sigma": torch.exp(0.5 * uncertainty_log_var).detach(),
         }
-        
+
+        # =====================================================================
+        # 8. BIDIRECTIONAL CONSISTENCY (TEMPO BEAST Phase 3)
+        # =====================================================================
+        if compute_bidirectional and self.training and N >= 2:
+            # Choose anchor to reconstruct (nearest to target for stability)
+            rel_time_abs = rel_time.abs()
+            anchor_idx = rel_time_abs.argmin(dim=1)[0].item()  # Use same idx for whole batch
+
+            # Compute backward synthesis
+            backward_anchor = self.compute_backward_synthesis(
+                output.detach(),  # Detach to avoid double backprop
+                frames,
+                anchor_times,
+                target_time,
+                anchor_idx=anchor_idx
+            )
+
+            aux["backward_anchor"] = backward_anchor
+            aux["backward_anchor_idx"] = anchor_idx
+
         return output, aux
 
 

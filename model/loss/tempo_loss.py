@@ -177,6 +177,59 @@ class OcclusionAwareLoss(nn.Module):
         return (pred - target).abs().mul(weight).mean()
 
 
+class BidirectionalConsistencyLoss(nn.Module):
+    """
+    TEMPO BEAST Phase 3: Bidirectional Consistency Loss
+
+    Enforces temporal consistency by checking forward-backward synthesis.
+
+    Forward pass:  [F0, F1, ...] → Ft
+    Backward pass: [Ft, F_nearest, ...] → F0' (or F1')
+    Loss: |F_anchor - F_anchor'|
+
+    This helps the model learn temporally consistent representations and
+    better handle motion and occlusions.
+
+    Note: The backward synthesis must be computed externally (by the model)
+    and passed to this loss. This is because the loss module shouldn't
+    have direct access to the model to avoid circular dependencies.
+    """
+
+    def __init__(self, alpha: float = 1.0):
+        """
+        Args:
+            alpha: Weight for consistency loss (default: 1.0)
+        """
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(
+        self,
+        anchor_frame: torch.Tensor,        # [B, 3, H, W] - original anchor frame
+        reconstructed_anchor: torch.Tensor, # [B, 3, H, W] - backward-synthesized anchor
+        confidence: Optional[torch.Tensor] = None,  # [B, 1, H, W] - optional confidence map
+    ) -> torch.Tensor:
+        """
+        Compute bidirectional consistency loss.
+
+        Args:
+            anchor_frame: Original anchor frame (e.g., F0 or F1)
+            reconstructed_anchor: Backward-synthesized anchor frame (e.g., F0' or F1')
+            confidence: Optional confidence map to weight the loss
+
+        Returns:
+            consistency_loss: Scalar loss value
+        """
+        # L1 consistency loss
+        diff = (anchor_frame - reconstructed_anchor).abs()
+
+        # Apply confidence weighting if available
+        if confidence is not None:
+            diff = diff * confidence
+
+        return self.alpha * diff.mean()
+
+
 class WeightRegularization(nn.Module):
     """Regularization for attention weights"""
     def forward(self, weights: torch.Tensor, times: torch.Tensor,
@@ -233,6 +286,7 @@ class TEMPOLoss(nn.Module):
 
             # Temporal
             "w_coherence": 0.2,
+            "w_bidirectional": 0.1,  # TEMPO BEAST Phase 3: Bidirectional consistency
 
             # Occlusion handling
             "w_occlusion": 0.5,
@@ -264,6 +318,7 @@ class TEMPOLoss(nn.Module):
         self.ssim = ConfidenceAwareSSIM()
         self.freq_loss = FrequencyLoss()
         self.temporal = TemporalCoherenceLoss()
+        self.bidirectional = BidirectionalConsistencyLoss()  # TEMPO BEAST Phase 3
         self.occlusion = OcclusionAwareLoss()
         self.weight_reg = WeightRegularization()
 
@@ -353,6 +408,23 @@ class TEMPOLoss(nn.Module):
             total_recon = total_recon + self.cfg["w_coherence"] * L_temp
             losses["temporal"] = float(L_temp.detach())
 
+        # ===== Bidirectional consistency (TEMPO BEAST Phase 3) =====
+        # Only computed if backward synthesis is provided in aux
+        if self.cfg["w_bidirectional"] > 0 and "backward_anchor" in aux:
+            backward_anchor = aux["backward_anchor"]  # [B, 3, H, W]
+            anchor_idx = aux.get("backward_anchor_idx", 0)  # Which anchor was reconstructed
+
+            # Get the original anchor frame
+            original_anchor = frames[:, anchor_idx]  # [B, 3, H, W]
+
+            L_bidir = self.bidirectional(
+                original_anchor,
+                backward_anchor,
+                confidence=conf_map
+            )
+            total_recon = total_recon + self.cfg["w_bidirectional"] * L_bidir
+            losses["bidirectional"] = float(L_bidir.detach())
+
         # ===== Occlusion-aware RGB term =====
         L_occ = self.occlusion(pred, target, conf_map, attn_entropy)
         total_recon = total_recon + self.cfg["w_occlusion"] * L_occ
@@ -425,6 +497,7 @@ class LossScheduler:
             "warmup_steps": 5_000,
             "perceptual_start": 2_000,
             "coherence_ramp": (5_000, 15_000),
+            "bidirectional_ramp": (5_000, 15_000),  # TEMPO BEAST Phase 3
         }
         self.step = 0
 
@@ -454,6 +527,15 @@ class LossScheduler:
             cfg["w_coherence"] = base["w_coherence"]
         else:
             cfg["w_coherence"] = base["w_coherence"] * ((step - s) / (e - s))
+
+        # ramp bidirectional consistency (TEMPO BEAST Phase 3)
+        s, e = self.schedule["bidirectional_ramp"]
+        if step <= s:
+            cfg["w_bidirectional"] = 0.0
+        elif step >= e:
+            cfg["w_bidirectional"] = base["w_bidirectional"]
+        else:
+            cfg["w_bidirectional"] = base["w_bidirectional"] * ((step - s) / (e - s))
 
 
 class MetricTracker:

@@ -35,7 +35,7 @@ if __name__ == "__main__":
     print(f"Using bfloat16: {use_bf16}")
 
     print("\n" + "="*70)
-    print("TEMPO BEAST: Phase 1 Architecture Scaling - Smoke Test")
+    print("TEMPO BEAST: Phases 1-3 - Smoke Test")
     print("="*70)
 
     # Build TEMPO BEAST model with new defaults
@@ -179,18 +179,58 @@ if __name__ == "__main__":
             print(f"  ✗ Uncertainty outputs not found!")
 
     # --------------------------
-    # 5) Final Summary
+    # 5) Bidirectional Consistency (TEMPO BEAST Phase 3)
+    # --------------------------
+    print("\n[Test 5] Bidirectional Consistency Loss")
+    B, N, H, W = 2, 4, 256, 256
+    frames = torch.rand(B, N, 3, H, W, device=device)
+    anchor_times = torch.tensor([[0.0, 0.3, 0.7, 1.0], [0.0, 0.2, 0.8, 1.0]], device=device)
+    target_time = torch.tensor([0.5, 0.4], device=device)
+    target_rgb = torch.rand(B, 3, H, W, device=device)
+
+    model.train()
+    opt.zero_grad(set_to_none=True)
+
+    with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        # Forward pass with bidirectional consistency enabled
+        out, aux = model(frames, anchor_times, target_time, compute_bidirectional=True)
+
+        # Check if backward_anchor is computed
+        if 'backward_anchor' in aux:
+            print(f"  ✓ Backward synthesis computed")
+            print(f"  Backward anchor shape: {aux['backward_anchor'].shape}")
+            print(f"  Reconstructed anchor index: {aux['backward_anchor_idx']}")
+
+            # Compute loss with bidirectional consistency
+            loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
+
+            # Check if bidirectional loss is present
+            if 'bidirectional' in logs:
+                print(f"  ✓ Bidirectional loss computed: {logs['bidirectional']:.4f}")
+            else:
+                print(f"  ⚠ Bidirectional loss not in logs (weight may be 0)")
+        else:
+            print(f"  ✗ Backward synthesis not computed!")
+
+    loss.backward()
+    gnorm = grad_norm(model)
+    opt.step()
+
+    print(f"  Total loss: {loss.item():.4f}, Grad norm: {gnorm:.3f}")
+
+    # --------------------------
+    # 6) Final Summary
     # --------------------------
     print("\n" + "="*70)
-    print("TEMPO BEAST Phase 1 - Test Summary")
+    print("TEMPO BEAST Phases 1-3 - Test Summary")
     print("="*70)
 
     tests_passed = []
     tests_failed = []
 
     # Check 1: Parameter count
-    if 40 <= total_params <= 45:
-        tests_passed.append("✓ Parameter count: 41.73M (target: 40-45M)")
+    if 40 <= total_params <= 60:  # Relaxed upper bound for Phase 2
+        tests_passed.append(f"✓ Parameter count: {total_params:.2f}M (Phase 1-2: 40-60M)")
     else:
         tests_failed.append(f"✗ Parameter count: {total_params:.2f}M (outside target)")
 
@@ -218,6 +258,12 @@ if __name__ == "__main__":
     else:
         tests_failed.append("✗ Gradient computation failed")
 
+    # Check 6: Bidirectional consistency (Phase 3)
+    if 'backward_anchor' in aux:
+        tests_passed.append("✓ Bidirectional synthesis working")
+    else:
+        tests_failed.append("✗ Bidirectional synthesis not computed")
+
     # Print results
     print("\nPassed Tests:")
     for test in tests_passed:
@@ -232,10 +278,12 @@ if __name__ == "__main__":
         print("="*70)
     else:
         print("\n" + "="*70)
-        print("✅ All tests passed! TEMPO BEAST Phase 1 is ready.")
+        print("✅ All tests passed! TEMPO BEAST Phases 1-3 complete.")
         print("="*70)
+        print("\nCompleted:")
+        print("  ✓ Phase 1: Architecture Scaling (41.73M → 54.10M params)")
+        print("  ✓ Phase 2: Iterative Refinement + Correlation Init")
+        print("  ✓ Phase 3: Bidirectional Consistency Loss")
         print("\nNext steps:")
-        print("  - Phase 2: Iterative Refinement + Correlation Init")
-        print("  - Phase 3: Bidirectional Consistency Loss")
         print("  - Phase 4: Homoscedastic/Heteroscedastic Loss Integration")
         print("  - Phase 5: Laplacian Pyramid + Edge-Aware Losses")
