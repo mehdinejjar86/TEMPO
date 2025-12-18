@@ -385,7 +385,7 @@ class ConvNeXtEncoder(nn.Module):
         super().__init__()
         
         if depths is None:
-            depths = [3, 3, 9, 3]  # Optimized for quality
+            depths = [3, 3, 18, 3]  # TEMPO BEAST: Scaled up for ~18M encoder params
         
         C = base_channels
         Ct = temporal_channels
@@ -497,7 +497,7 @@ class NAFNetDecoder(nn.Module):
         super().__init__()
         
         if depths is None:
-            depths = [2, 2, 2, 2]  # Blocks per decoder stage
+            depths = [3, 3, 9, 3]  # TEMPO BEAST: Scaled up for ~12M decoder params
         
         C = base_channels
         Ct = temporal_channels  # +1 for speed token handled by caller
@@ -541,7 +541,16 @@ class NAFNetDecoder(nn.Module):
         self.refine = nn.ModuleList([
             NAFBlockNoGate(C, Ct) for _ in range(depths[3])
         ])
-        
+
+        # TEMPO BEAST: Heteroscedastic uncertainty head
+        # Predicts per-pixel log-variance for uncertainty estimation
+        self.uncertainty_head = nn.Sequential(
+            nn.Conv2d(C, C // 2, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(C // 2, 1, 1),
+            nn.Softplus()  # Ensures positive output: log(σ²)
+        )
+
         self.to_rgb = nn.Sequential(
             LayerNorm2d(C),
             nn.Conv2d(C, 3, kernel_size=3, padding=1),
@@ -572,9 +581,10 @@ class NAFNetDecoder(nn.Module):
             f3: [B, C*4, H/4, W/4] - 1/4× fused features
             f4: [B, C*8, H/8, W/8] - 1/8× fused features
             tenc_with_speed: [B, Ct+1] temporal encoding with speed token
-        
+
         Returns:
             out: [B, 3, H, W] - reconstructed frame
+            uncertainty_log_var: [B, 1, H, W] - heteroscedastic uncertainty (log variance)
         """
         t_emb = tenc_with_speed
         
@@ -599,11 +609,14 @@ class NAFNetDecoder(nn.Module):
         # Final refinement
         for block in self.refine:
             x = block(x, t_emb)
-        
+
+        # TEMPO BEAST: Predict heteroscedastic uncertainty (per-pixel log-variance)
+        uncertainty_log_var = self.uncertainty_head(x)
+
         # To RGB
         out = self.to_rgb(x)
-        
-        return out
+
+        return out, uncertainty_log_var
 
 
 # ==============================================================================

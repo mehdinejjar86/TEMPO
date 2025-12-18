@@ -44,7 +44,7 @@ class TEMPO(nn.Module):
     
     def __init__(
         self,
-        base_channels: int = 64,
+        base_channels: int = 80,  # TEMPO BEAST: Scaled up from 64 to 80 for ~42M params
         temporal_channels: int = 64,
         # Encoder
         encoder_depths: list = None,
@@ -54,20 +54,20 @@ class TEMPO(nn.Module):
         decoder_drop_path: float = 0.05,
         # Fusion
         num_heads: int = 8,
-        num_points: int = 4,
+        num_points: int = 6,  # TEMPO BEAST: Updated from 4 to 6
         use_cross_scale: bool = True,
         fusion_dropout: float = 0.0,
     ):
         super().__init__()
-        
+
         C = base_channels
         Ct = temporal_channels
-        
-        # Defaults (larger for better quality)
+
+        # TEMPO BEAST defaults (~42M parameters)
         if encoder_depths is None:
-            encoder_depths = [3, 3, 12, 3]  # ConvNeXt-S like
+            encoder_depths = [3, 3, 18, 3]  # TEMPO BEAST: Scaled up from [3,3,12,3]
         if decoder_depths is None:
-            decoder_depths = [3, 3, 3, 3]
+            decoder_depths = [3, 3, 9, 3]  # TEMPO BEAST: Scaled up from [3,3,3,3]
         
         # Temporal encoding
         self.temporal_encoder = TemporalPositionEncoding(channels=Ct)
@@ -196,9 +196,10 @@ class TEMPO(nn.Module):
         tgt_enc = self.temporal_encoder(torch.zeros(B, 1, device=device))[:, 0]
         speed = self._compute_speed_token(anchor_times, target_time)
         tgt_enc_with_speed = torch.cat([tgt_enc, speed], dim=-1)
-        
-        output = self.decoder(f1, f2, f3, f4, tgt_enc_with_speed)
-        
+
+        # TEMPO BEAST: Decoder now returns (rgb, uncertainty_log_var)
+        output, uncertainty_log_var = self.decoder(f1, f2, f3, f4, tgt_enc_with_speed)
+
         # =====================================================================
         # 7. AUX OUTPUTS
         # =====================================================================
@@ -208,6 +209,9 @@ class TEMPO(nn.Module):
             "entropy": entropy.detach(),
             "prior_alpha": prior_info["alpha"],
             "prior_bimix": prior_info["bimix"],
+            # TEMPO BEAST: Heteroscedastic uncertainty outputs
+            "uncertainty_log_var": uncertainty_log_var.detach(),
+            "uncertainty_sigma": torch.exp(0.5 * uncertainty_log_var).detach(),
         }
         
         return output, aux
@@ -218,13 +222,13 @@ class TEMPO(nn.Module):
 # ==============================================================================
 
 def build_tempo(
-    base_channels: int = 64,
+    base_channels: int = 80,  # TEMPO BEAST: Scaled from 64 to 80 for ~42M params
     temporal_channels: int = 64,
     encoder_depths: list = None,
     decoder_depths: list = None,
     # Fusion settings
     num_heads: int = 8,
-    num_points: int = 4,
+    num_points: int = 6,  # TEMPO BEAST: Updated from 4 to 6
     use_cross_scale: bool = True,
     # Legacy (ignored)
     attn_heads: int = None,
@@ -235,18 +239,23 @@ def build_tempo(
 ):
     """
     Build TEMPO model.
-    
-    Presets:
-        Quality (default):
+
+    TEMPO BEAST (default):
+        base_channels=80, encoder_depths=[3,3,18,3], decoder_depths=[3,3,9,3]
+        num_heads=8, num_points=6
+        ~42M params - Phase 1 architecture scaling complete
+
+    Other Presets:
+        Quality:
             encoder_depths=[3,3,12,3], decoder_depths=[3,3,3,3]
             num_heads=8, num_points=4
             ~25M params
-        
+
         Large:
             encoder_depths=[3,3,18,3], decoder_depths=[3,3,6,3]
             num_heads=8, num_points=6
             ~35M params
-        
+
         Fast:
             encoder_depths=[2,2,6,2], decoder_depths=[2,2,2,2]
             num_heads=4, num_points=4

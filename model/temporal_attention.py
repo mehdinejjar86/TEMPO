@@ -74,7 +74,7 @@ class DeformableTemporalAttention(nn.Module):
         channels: int,
         temporal_channels: int,
         num_heads: int = 8,
-        num_points: int = 4,
+        num_points: int = 6,  # TEMPO BEAST: Increased from 4 to 6 (48 total samples)
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -94,9 +94,12 @@ class DeformableTemporalAttention(nn.Module):
         # =====================
         # Offset prediction (WHERE to look)
         # Time-conditioned: offset depends on temporal distance
+        # TEMPO BEAST: Added extra capacity for better motion estimation
         # =====================
         self.offset_net = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels),  # Spatial context
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),  # Added: Extra intermediate layer
             nn.GELU(),
             nn.Conv2d(channels, channels // 2, 1),
             nn.GELU(),
@@ -111,11 +114,14 @@ class DeformableTemporalAttention(nn.Module):
         
         # =====================
         # Attention prediction (HOW MUCH to weight)
+        # TEMPO BEAST: Added spatial context layer for better attention
         # =====================
         self.attn_net = nn.Sequential(
             nn.Conv2d(channels, channels // 2, 1),
             nn.GELU(),
-            nn.Conv2d(channels // 2, num_heads * num_points, 1),
+            nn.Conv2d(channels // 2, channels // 4, 3, padding=1),  # Added: Spatial context
+            nn.GELU(),
+            nn.Conv2d(channels // 4, num_heads * num_points, 1),
         )
         
         # Time bias for attention (closer observations → higher weight)
