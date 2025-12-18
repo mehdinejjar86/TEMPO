@@ -35,7 +35,7 @@ if __name__ == "__main__":
     print(f"Using bfloat16: {use_bf16}")
 
     print("\n" + "="*70)
-    print("TEMPO BEAST: Phases 1-3 - Smoke Test")
+    print("TEMPO BEAST: Phases 1-4 - Smoke Test")
     print("="*70)
 
     # Build TEMPO BEAST model with new defaults
@@ -219,10 +219,53 @@ if __name__ == "__main__":
     print(f"  Total loss: {loss.item():.4f}, Grad norm: {gnorm:.3f}")
 
     # --------------------------
-    # 6) Final Summary
+    # 6) Uncertainty Integration (TEMPO BEAST Phase 4)
+    # --------------------------
+    print("\n[Test 6] Homoscedastic & Heteroscedastic Uncertainty")
+    B, N, H, W = 2, 4, 256, 256
+    frames = torch.rand(B, N, 3, H, W, device=device)
+    anchor_times = torch.tensor([[0.0, 0.3, 0.7, 1.0], [0.0, 0.2, 0.8, 1.0]], device=device)
+    target_time = torch.tensor([0.5, 0.4], device=device)
+    target_rgb = torch.rand(B, 3, H, W, device=device)
+
+    model.train()
+    opt.zero_grad(set_to_none=True)
+
+    with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        out, aux = model(frames, anchor_times, target_time)
+        loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
+
+        # Check homoscedastic uncertainty
+        has_homo = any(k.startswith('homo_weight') for k in logs.keys())
+        if has_homo:
+            print(f"  ✓ Homoscedastic weights present")
+            # Show first 3 weights
+            weights_sample = {k: v for k, v in logs.items() if k.startswith('homo_weight') and int(k.split('_')[-1]) < 3}
+            print(f"  Sample weights: {weights_sample}")
+
+            # Show log-variances
+            logvars_sample = {k: v for k, v in logs.items() if k.startswith('homo_logvar') and int(k.split('_')[-1]) < 3}
+            print(f"  Sample log-vars: {logvars_sample}")
+        else:
+            print(f"  ✗ Homoscedastic weights not found")
+
+        # Check heteroscedastic loss
+        if 'heteroscedastic' in logs:
+            print(f"  ✓ Heteroscedastic loss computed: {logs['heteroscedastic']:.4f}")
+        else:
+            print(f"  ⚠ Heteroscedastic loss not in logs")
+
+    loss.backward()
+    gnorm = grad_norm(model)
+    opt.step()
+
+    print(f"  Total loss: {loss.item():.4f}, Grad norm: {gnorm:.3f}")
+
+    # --------------------------
+    # 7) Final Summary
     # --------------------------
     print("\n" + "="*70)
-    print("TEMPO BEAST Phases 1-3 - Test Summary")
+    print("TEMPO BEAST Phases 1-4 - Test Summary")
     print("="*70)
 
     tests_passed = []
@@ -264,6 +307,18 @@ if __name__ == "__main__":
     else:
         tests_failed.append("✗ Bidirectional synthesis not computed")
 
+    # Check 7: Homoscedastic uncertainty (Phase 4)
+    if has_homo:
+        tests_passed.append("✓ Homoscedastic uncertainty working")
+    else:
+        tests_failed.append("✗ Homoscedastic uncertainty not computed")
+
+    # Check 8: Heteroscedastic loss (Phase 4)
+    if 'heteroscedastic' in logs:
+        tests_passed.append("✓ Heteroscedastic loss working")
+    else:
+        tests_failed.append("✗ Heteroscedastic loss not computed")
+
     # Print results
     print("\nPassed Tests:")
     for test in tests_passed:
@@ -278,12 +333,12 @@ if __name__ == "__main__":
         print("="*70)
     else:
         print("\n" + "="*70)
-        print("✅ All tests passed! TEMPO BEAST Phases 1-3 complete.")
+        print("✅ All tests passed! TEMPO BEAST Phases 1-4 complete.")
         print("="*70)
         print("\nCompleted:")
         print("  ✓ Phase 1: Architecture Scaling (41.73M → 54.10M params)")
         print("  ✓ Phase 2: Iterative Refinement + Correlation Init")
         print("  ✓ Phase 3: Bidirectional Consistency Loss")
+        print("  ✓ Phase 4: Homoscedastic & Heteroscedastic Uncertainty")
         print("\nNext steps:")
-        print("  - Phase 4: Homoscedastic/Heteroscedastic Loss Integration")
         print("  - Phase 5: Laplacian Pyramid + Edge-Aware Losses")

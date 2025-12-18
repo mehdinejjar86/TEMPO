@@ -8,7 +8,7 @@
 # - TV + luma/chroma stabilization
 # - Cut/fallback gating
 import math, warnings
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -230,6 +230,122 @@ class BidirectionalConsistencyLoss(nn.Module):
         return self.alpha * diff.mean()
 
 
+class HomoscedasticUncertainty(nn.Module):
+    """
+    TEMPO BEAST Phase 4: Homoscedastic Uncertainty for Automatic Loss Balancing
+
+    Based on "Multi-Task Learning Using Uncertainty to Weigh Losses" (Kendall et al., 2018)
+
+    Learns task-level uncertainty (one log-variance per task) to automatically
+    balance multiple loss terms during training.
+
+    Loss formula: L = (1 / 2σ²) * L_task + log(σ)
+    - First term: Precision-weighted task loss (higher σ → lower weight)
+    - Second term: Regularization to prevent σ → ∞
+
+    This eliminates manual hyperparameter tuning for loss weights!
+    """
+
+    def __init__(self, num_tasks: int = 7):
+        """
+        Args:
+            num_tasks: Number of loss terms to balance (default: 7)
+                      Tasks: L1, SSIM, freq_struct, freq_phase, temporal, occlusion, perceptual
+        """
+        super().__init__()
+        # Initialize log-variances to 0 (σ² = 1, equal weighting at start)
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+
+    def forward(self, losses: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Apply uncertainty-based weighting to multiple losses.
+
+        Args:
+            losses: List of scalar loss tensors (one per task)
+
+        Returns:
+            total_loss: Uncertainty-weighted sum of losses
+            weights_dict: Effective weights (1/σ²) for monitoring
+        """
+        assert len(losses) == len(self.log_vars), \
+            f"Expected {len(self.log_vars)} losses, got {len(losses)}"
+
+        weighted_losses = []
+        effective_weights = {}
+
+        for i, loss in enumerate(losses):
+            # Precision = 1 / σ² = exp(-log_var)
+            precision = torch.exp(-self.log_vars[i])
+
+            # Weighted loss: (1 / 2σ²) * L + (1/2) * log(σ²)
+            weighted = 0.5 * precision * loss + 0.5 * self.log_vars[i]
+            weighted_losses.append(weighted)
+
+            # Store effective weight for monitoring (1/σ²)
+            effective_weights[f"weight_{i}"] = precision.detach().item()
+
+        total = torch.stack(weighted_losses).sum()
+
+        return total, effective_weights
+
+
+class HeteroscedasticLoss(nn.Module):
+    """
+    TEMPO BEAST Phase 4: Heteroscedastic Uncertainty for Pixel-Level Weighting
+
+    Uses per-pixel uncertainty predictions to weight reconstruction loss.
+    Uncertain regions (motion blur, occlusion) get lower weight.
+
+    Loss formula: L = (1 / 2σ²) * (pred - target)² + (1/2) * log(σ²)
+    - Pixel-wise adaptive weighting based on predicted uncertainty
+    - Regularization prevents σ → ∞
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        """
+        Args:
+            reduction: How to reduce spatial dimensions ('mean' or 'sum')
+        """
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(
+        self,
+        pred: torch.Tensor,              # [B, 3, H, W] - predicted RGB
+        target: torch.Tensor,            # [B, 3, H, W] - target RGB
+        log_var: torch.Tensor,           # [B, 1, H, W] - predicted log(σ²)
+    ) -> torch.Tensor:
+        """
+        Compute heteroscedastic uncertainty-weighted reconstruction loss.
+
+        Args:
+            pred: Predicted image
+            target: Ground truth image
+            log_var: Predicted log-variance (uncertainty) per pixel
+
+        Returns:
+            loss: Scalar loss value
+        """
+        # Precision = 1 / σ²
+        precision = torch.exp(-log_var)  # [B, 1, H, W]
+
+        # Squared error
+        sq_error = (pred - target).pow(2).mean(dim=1, keepdim=True)  # [B, 1, H, W]
+
+        # Weighted loss: (1 / 2σ²) * error² + (1/2) * log(σ²)
+        weighted_error = 0.5 * precision * sq_error
+        regularization = 0.5 * log_var
+
+        loss = weighted_error + regularization
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
 class WeightRegularization(nn.Module):
     """Regularization for attention weights"""
     def forward(self, weights: torch.Tensor, times: torch.Tensor,
@@ -308,6 +424,11 @@ class TEMPOLoss(nn.Module):
             "w_perceptual": 0.05,
             "use_perceptual": True,
 
+            # TEMPO BEAST Phase 4: Uncertainty
+            "use_homoscedastic": True,   # Automatic loss balancing
+            "use_heteroscedastic": True,  # Pixel-level uncertainty weighting
+            "w_heteroscedastic": 0.5,     # Weight for heteroscedastic loss
+
             # Scene cut handling
             "cut_loss_scale": 0.3,  # Reduce loss when cut detected
         }
@@ -321,6 +442,16 @@ class TEMPOLoss(nn.Module):
         self.bidirectional = BidirectionalConsistencyLoss()  # TEMPO BEAST Phase 3
         self.occlusion = OcclusionAwareLoss()
         self.weight_reg = WeightRegularization()
+
+        # TEMPO BEAST Phase 4: Uncertainty modules
+        self.homoscedastic = None
+        if self.cfg["use_homoscedastic"]:
+            # 7 tasks: L1, SSIM, freq_struct, freq_phase, temporal, occlusion, perceptual
+            self.homoscedastic = HomoscedasticUncertainty(num_tasks=7)
+
+        self.heteroscedastic_loss = None
+        if self.cfg["use_heteroscedastic"]:
+            self.heteroscedastic_loss = HeteroscedasticLoss(reduction='mean')
 
         # Optional perceptual loss
         self.perceptual = None
@@ -466,6 +597,62 @@ class TEMPOLoss(nn.Module):
             perc = self.perceptual((p_perc * 2 - 1).float(), (t_perc * 2 - 1).float()).mean()
             total_recon = total_recon + self.cfg["w_perceptual"] * perc
             losses["perceptual"] = float(perc.detach())
+
+        # ===== TEMPO BEAST Phase 4: Apply Uncertainty-Based Weighting =====
+        # This replaces manual loss weighting with learned uncertainty
+        if self.homoscedastic is not None:
+            # Collect task losses (without manual weights)
+            # Tasks: [L1, SSIM, freq_struct, freq_phase, temporal, occlusion, perceptual]
+            task_losses = []
+
+            # 1. L1 (from finest scale)
+            p_s, t_s, c_s = pred, target, conf_map
+            L1_raw = self.charb(p_s - t_s, 0) * c_s * gate
+            task_losses.append(L1_raw.mean())
+
+            # 2. SSIM
+            SS_raw = self.ssim(p_s, t_s, c_s) * gate.mean()
+            task_losses.append(SS_raw)
+
+            # 3. Frequency structure
+            task_losses.append(freq_struct)
+
+            # 4. Frequency phase
+            task_losses.append(freq_phase)
+
+            # 5. Temporal coherence (or zero if N=1)
+            if N > 1 and "temporal" in locals():
+                task_losses.append(L_temp)
+            else:
+                task_losses.append(pred.new_tensor(0.0))
+
+            # 6. Occlusion-aware
+            task_losses.append(L_occ)
+
+            # 7. Perceptual (or zero if disabled)
+            if self.cfg["w_perceptual"] > 0 and "perc" in locals():
+                task_losses.append(perc)
+            else:
+                task_losses.append(pred.new_tensor(0.0))
+
+            # Apply homoscedastic uncertainty weighting
+            total_recon, eff_weights = self.homoscedastic(task_losses)
+
+            # Log effective weights for monitoring
+            losses.update({f"homo_{k}": v for k, v in eff_weights.items()})
+            losses["total_homoscedastic"] = float(total_recon.detach())
+
+            # Log learned log-variances (σ²)
+            for i, log_var in enumerate(self.homoscedastic.log_vars):
+                losses[f"homo_logvar_{i}"] = float(log_var.detach())
+
+        # ===== Heteroscedastic Loss (Pixel-Level Uncertainty) =====
+        if self.heteroscedastic_loss is not None and "uncertainty_log_var" in aux:
+            log_var = aux["uncertainty_log_var"]  # [B, 1, H, W]
+
+            L_hetero = self.heteroscedastic_loss(pred, target, log_var)
+            total_recon = total_recon + self.cfg["w_heteroscedastic"] * L_hetero
+            losses["heteroscedastic"] = float(L_hetero.detach())
 
         total = total_recon + reg
         losses["total"] = float(total.detach())
