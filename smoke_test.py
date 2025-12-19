@@ -262,10 +262,45 @@ if __name__ == "__main__":
     print(f"  Total loss: {loss.item():.4f}, Grad norm: {gnorm:.3f}")
 
     # --------------------------
-    # 7) Final Summary
+    # 7) Laplacian Pyramid & Edge-Aware Losses (TEMPO BEAST Phase 5)
+    # --------------------------
+    print("\n[Test 7] Laplacian Pyramid & Edge-Aware Losses")
+    B, N, H, W = 2, 4, 256, 256
+    frames = torch.rand(B, N, 3, H, W, device=device)
+    anchor_times = torch.tensor([[0.0, 0.3, 0.7, 1.0], [0.0, 0.2, 0.8, 1.0]], device=device)
+    target_time = torch.tensor([0.5, 0.4], device=device)
+    target_rgb = torch.rand(B, 3, H, W, device=device)
+
+    model.train()
+    opt.zero_grad(set_to_none=True)
+
+    with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        out, aux = model(frames, anchor_times, target_time)
+        loss, logs = tempo_loss(out, target_rgb, aux, anchor_times, target_time, frames=frames)
+
+        # Check Laplacian pyramid loss
+        if 'laplacian' in logs:
+            print(f"  ✓ Laplacian pyramid loss computed: {logs['laplacian']:.4f}")
+        else:
+            print(f"  ✗ Laplacian pyramid loss not in logs")
+
+        # Check edge-aware loss
+        if 'edge_aware' in logs:
+            print(f"  ✓ Edge-aware loss computed: {logs['edge_aware']:.4f}")
+        else:
+            print(f"  ✗ Edge-aware loss not in logs")
+
+    loss.backward()
+    gnorm = grad_norm(model)
+    opt.step()
+
+    print(f"  Total loss: {loss.item():.4f}, Grad norm: {gnorm:.3f}")
+
+    # --------------------------
+    # 8) Final Summary
     # --------------------------
     print("\n" + "="*70)
-    print("TEMPO BEAST Phases 1-4 - Test Summary")
+    print("TEMPO BEAST Phases 1-5 - Test Summary")
     print("="*70)
 
     tests_passed = []
@@ -319,6 +354,18 @@ if __name__ == "__main__":
     else:
         tests_failed.append("✗ Heteroscedastic loss not computed")
 
+    # Check 9: Laplacian pyramid loss (Phase 5)
+    if 'laplacian' in logs:
+        tests_passed.append("✓ Laplacian pyramid loss working")
+    else:
+        tests_failed.append("✗ Laplacian pyramid loss not computed")
+
+    # Check 10: Edge-aware loss (Phase 5)
+    if 'edge_aware' in logs:
+        tests_passed.append("✓ Edge-aware loss working")
+    else:
+        tests_failed.append("✗ Edge-aware loss not computed")
+
     # Print results
     print("\nPassed Tests:")
     for test in tests_passed:
@@ -333,12 +380,14 @@ if __name__ == "__main__":
         print("="*70)
     else:
         print("\n" + "="*70)
-        print("✅ All tests passed! TEMPO BEAST Phases 1-4 complete.")
+        print("✅ All tests passed! TEMPO BEAST Phases 1-5 complete.")
         print("="*70)
         print("\nCompleted:")
         print("  ✓ Phase 1: Architecture Scaling (41.73M → 54.10M params)")
         print("  ✓ Phase 2: Iterative Refinement + Correlation Init")
         print("  ✓ Phase 3: Bidirectional Consistency Loss")
         print("  ✓ Phase 4: Homoscedastic & Heteroscedastic Uncertainty")
-        print("\nNext steps:")
-        print("  - Phase 5: Laplacian Pyramid + Edge-Aware Losses")
+        print("  ✓ Phase 5: Laplacian Pyramid + Edge-Aware Losses")
+        print("\n🎉 TEMPO BEAST Implementation Complete! 🎉")
+        print("\nAll features implemented (11/11 = 100%)")
+        print("Ready for training and evaluation!")

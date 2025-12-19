@@ -346,6 +346,221 @@ class HeteroscedasticLoss(nn.Module):
             return loss
 
 
+class LaplacianPyramidLoss(nn.Module):
+    """
+    TEMPO BEAST Phase 5: Laplacian Pyramid Loss for Multi-Scale Edge Preservation
+
+    Uses multi-scale bandpass filtering to preserve edges and fine details.
+    Builds Gaussian pyramid then computes Laplacian as differences between levels.
+
+    Laplacian pyramid: L_i = G_i - upsample(G_{i+1})
+    where G_i is the i-th level of the Gaussian pyramid.
+
+    This provides better edge preservation than standard MSE/L1 by explicitly
+    supervising at multiple frequency bands.
+    """
+
+    def __init__(self, num_levels: int = 4, level_weights: Optional[List[float]] = None):
+        """
+        Args:
+            num_levels: Number of pyramid levels (default: 4)
+            level_weights: Weights for each level (default: [1.0, 0.8, 0.6, 0.4])
+                          Emphasizes finer scales for sharper details
+        """
+        super().__init__()
+        self.num_levels = num_levels
+        self.level_weights = level_weights or [1.0, 0.8, 0.6, 0.4][:num_levels]
+
+        # Gaussian kernel for pyramid construction (5x5)
+        # σ = 1.0 for smooth downsampling
+        kernel_1d = torch.tensor([1., 4., 6., 4., 1.]) / 16.0
+        kernel_2d = kernel_1d.view(-1, 1) @ kernel_1d.view(1, -1)  # [5, 5]
+        self.register_buffer("gaussian_kernel", kernel_2d.unsqueeze(0).unsqueeze(0))  # [1, 1, 5, 5]
+
+    def _build_gaussian_pyramid(self, img: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Build Gaussian pyramid by iterative smoothing and downsampling.
+
+        Args:
+            img: [B, C, H, W] input image
+
+        Returns:
+            pyramid: List of [B, C, H_i, W_i] at each level
+        """
+        pyramid = [img]
+        current = img
+
+        for _ in range(self.num_levels - 1):
+            # Smooth with Gaussian kernel
+            B, C, H, W = current.shape
+            kernel = self.gaussian_kernel.to(device=current.device, dtype=current.dtype).expand(C, 1, 5, 5)
+            smoothed = F.conv2d(current, kernel, padding=2, groups=C)
+
+            # Downsample by 2
+            downsampled = F.avg_pool2d(smoothed, kernel_size=2, stride=2)
+
+            pyramid.append(downsampled)
+            current = downsampled
+
+        return pyramid
+
+    def _build_laplacian_pyramid(self, img: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Build Laplacian pyramid from Gaussian pyramid.
+
+        Laplacian[i] = Gaussian[i] - upsample(Gaussian[i+1])
+
+        Args:
+            img: [B, C, H, W] input image
+
+        Returns:
+            laplacian: List of [B, C, H_i, W_i] Laplacian levels
+        """
+        gaussian = self._build_gaussian_pyramid(img)
+        laplacian = []
+
+        for i in range(len(gaussian) - 1):
+            current_level = gaussian[i]
+            next_level = gaussian[i + 1]
+
+            # Upsample next level to match current size
+            H, W = current_level.shape[-2:]
+            upsampled = F.interpolate(next_level, size=(H, W), mode='bilinear', align_corners=False)
+
+            # Laplacian = current - upsampled_next
+            laplacian.append(current_level - upsampled)
+
+        # Last level is just the coarsest Gaussian (residual)
+        laplacian.append(gaussian[-1])
+
+        return laplacian
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Laplacian pyramid loss between prediction and target.
+
+        Args:
+            pred: [B, C, H, W] predicted image
+            target: [B, C, H, W] target image
+
+        Returns:
+            loss: Weighted sum of L1 losses at each pyramid level
+        """
+        # Build Laplacian pyramids
+        laplacian_pred = self._build_laplacian_pyramid(pred)
+        laplacian_target = self._build_laplacian_pyramid(target)
+
+        # Compute weighted loss at each level
+        total_loss = pred.new_tensor(0.0)
+
+        for i, weight in enumerate(self.level_weights):
+            if i < len(laplacian_pred):
+                # L1 loss at this level
+                level_loss = (laplacian_pred[i] - laplacian_target[i]).abs().mean()
+                total_loss = total_loss + weight * level_loss
+
+        return total_loss
+
+
+class EdgeAwareLoss(nn.Module):
+    """
+    TEMPO BEAST Phase 5: Edge-Aware Loss with Gradient-Based Weighting
+
+    Weights reconstruction loss by edge strength using Sobel gradient detection.
+    Regions with strong edges get higher weight (2× by default).
+
+    This improves perceptual quality by focusing on visually important edges.
+    """
+
+    def __init__(self, edge_weight: float = 2.0):
+        """
+        Args:
+            edge_weight: Weight multiplier for edge regions (default: 2.0)
+                        1.0 = no weighting, 2.0 = 2× weight for edges
+        """
+        super().__init__()
+        self.edge_weight = edge_weight
+
+        # Sobel kernels for gradient detection
+        sobel_x = torch.tensor([
+            [-1., 0., 1.],
+            [-2., 0., 2.],
+            [-1., 0., 1.]
+        ]) / 8.0
+
+        sobel_y = torch.tensor([
+            [-1., -2., -1.],
+            [ 0.,  0.,  0.],
+            [ 1.,  2.,  1.]
+        ]) / 8.0
+
+        # Register as buffers [1, 1, 3, 3]
+        self.register_buffer("sobel_x", sobel_x.unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sobel_y", sobel_y.unsqueeze(0).unsqueeze(0))
+
+    def _compute_edge_map(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Compute edge strength map using Sobel gradients.
+
+        Args:
+            img: [B, C, H, W] input image
+
+        Returns:
+            edge_map: [B, 1, H, W] gradient magnitude in [0, 1]
+        """
+        # Convert to grayscale for edge detection
+        # Standard RGB→Y conversion: 0.299*R + 0.587*G + 0.114*B
+        if img.shape[1] == 3:
+            gray = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+        else:
+            gray = img
+
+        # Apply Sobel filters
+        sobel_x = self.sobel_x.to(device=img.device, dtype=img.dtype)
+        sobel_y = self.sobel_y.to(device=img.device, dtype=img.dtype)
+
+        grad_x = F.conv2d(gray, sobel_x, padding=1)
+        grad_y = F.conv2d(gray, sobel_y, padding=1)
+
+        # Gradient magnitude
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
+
+        # Normalize to [0, 1]
+        grad_mag = grad_mag / (grad_mag.max() + 1e-6)
+
+        return grad_mag
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute edge-aware L1 loss.
+
+        Args:
+            pred: [B, C, H, W] predicted image
+            target: [B, C, H, W] target image
+
+        Returns:
+            loss: Edge-weighted L1 reconstruction loss
+        """
+        # Compute edge maps for both pred and target
+        edge_pred = self._compute_edge_map(pred)
+        edge_target = self._compute_edge_map(target)
+
+        # Combined edge strength (max of pred and target)
+        edge_strength = torch.max(edge_pred, edge_target)  # [B, 1, H, W]
+
+        # Create weight map: 1.0 + (edge_weight - 1.0) * edge_strength
+        # Non-edges: weight ≈ 1.0, Strong edges: weight ≈ edge_weight
+        weight_map = 1.0 + (self.edge_weight - 1.0) * edge_strength
+
+        # L1 loss with edge weighting
+        l1_loss = (pred - target).abs()  # [B, C, H, W]
+
+        # Apply weights (broadcast across channels)
+        weighted_loss = l1_loss * weight_map
+
+        return weighted_loss.mean()
+
+
 class WeightRegularization(nn.Module):
     """Regularization for attention weights"""
     def forward(self, weights: torch.Tensor, times: torch.Tensor,
@@ -429,6 +644,12 @@ class TEMPOLoss(nn.Module):
             "use_heteroscedastic": True,  # Pixel-level uncertainty weighting
             "w_heteroscedastic": 0.5,     # Weight for heteroscedastic loss
 
+            # TEMPO BEAST Phase 5: Advanced Losses
+            "w_laplacian": 0.5,           # Laplacian pyramid loss
+            "w_edge_aware": 0.3,          # Edge-aware weighting
+            "laplacian_levels": 4,        # Number of pyramid levels
+            "edge_weight_multiplier": 2.0, # 2× weight for edges
+
             # Scene cut handling
             "cut_loss_scale": 0.3,  # Reduce loss when cut detected
         }
@@ -452,6 +673,15 @@ class TEMPOLoss(nn.Module):
         self.heteroscedastic_loss = None
         if self.cfg["use_heteroscedastic"]:
             self.heteroscedastic_loss = HeteroscedasticLoss(reduction='mean')
+
+        # TEMPO BEAST Phase 5: Advanced losses
+        self.laplacian_loss = LaplacianPyramidLoss(
+            num_levels=self.cfg["laplacian_levels"],
+            level_weights=[1.0, 0.8, 0.6, 0.4][:self.cfg["laplacian_levels"]]
+        )
+        self.edge_aware_loss = EdgeAwareLoss(
+            edge_weight=self.cfg["edge_weight_multiplier"]
+        )
 
         # Optional perceptual loss
         self.perceptual = None
@@ -654,6 +884,18 @@ class TEMPOLoss(nn.Module):
             total_recon = total_recon + self.cfg["w_heteroscedastic"] * L_hetero
             losses["heteroscedastic"] = float(L_hetero.detach())
 
+        # ===== TEMPO BEAST Phase 5: Laplacian Pyramid Loss =====
+        if self.cfg["w_laplacian"] > 0:
+            L_laplacian = self.laplacian_loss(pred * gate, target * gate)
+            total_recon = total_recon + self.cfg["w_laplacian"] * L_laplacian
+            losses["laplacian"] = float(L_laplacian.detach())
+
+        # ===== TEMPO BEAST Phase 5: Edge-Aware Loss =====
+        if self.cfg["w_edge_aware"] > 0:
+            L_edge = self.edge_aware_loss(pred * gate, target * gate)
+            total_recon = total_recon + self.cfg["w_edge_aware"] * L_edge
+            losses["edge_aware"] = float(L_edge.detach())
+
         total = total_recon + reg
         losses["total"] = float(total.detach())
         losses["cut_rate"] = float(fallback_mask.float().mean().detach())
@@ -685,6 +927,8 @@ class LossScheduler:
             "perceptual_start": 2_000,
             "coherence_ramp": (5_000, 15_000),
             "bidirectional_ramp": (5_000, 15_000),  # TEMPO BEAST Phase 3
+            "laplacian_ramp": (5_000, 15_000),      # TEMPO BEAST Phase 5
+            "edge_aware_ramp": (5_000, 15_000),     # TEMPO BEAST Phase 5
         }
         self.step = 0
 
@@ -723,6 +967,24 @@ class LossScheduler:
             cfg["w_bidirectional"] = base["w_bidirectional"]
         else:
             cfg["w_bidirectional"] = base["w_bidirectional"] * ((step - s) / (e - s))
+
+        # ramp Laplacian pyramid loss (TEMPO BEAST Phase 5)
+        s, e = self.schedule["laplacian_ramp"]
+        if step <= s:
+            cfg["w_laplacian"] = 0.0
+        elif step >= e:
+            cfg["w_laplacian"] = base["w_laplacian"]
+        else:
+            cfg["w_laplacian"] = base["w_laplacian"] * ((step - s) / (e - s))
+
+        # ramp edge-aware loss (TEMPO BEAST Phase 5)
+        s, e = self.schedule["edge_aware_ramp"]
+        if step <= s:
+            cfg["w_edge_aware"] = 0.0
+        elif step >= e:
+            cfg["w_edge_aware"] = base["w_edge_aware"]
+        else:
+            cfg["w_edge_aware"] = base["w_edge_aware"] * ((step - s) / (e - s))
 
 
 class MetricTracker:
