@@ -249,13 +249,12 @@ class DeformableTemporalAttention(nn.Module):
                     grid_h = base_grid + offset_p[:, h]  # [B, H, W, 2]
                     grid_h = grid_h.clamp(-1, 1)
                     
-                    # Sample
-                    padding_mode = "zeros" if torch.backends.mps.is_available() else "border"
+                    # Sample (using 'border' padding for all devices - torch.compile compatible)
                     sampled = F.grid_sample(
                         v_n[:, h],  # [B, head_dim, H, W]
                         grid_h,
                         mode='bilinear',
-                        padding_mode=padding_mode,
+                        padding_mode='border',  # Works on all devices (CUDA, MPS, CPU)
                         align_corners=True
                     )  # [B, head_dim, H, W]
                     head_samples.append(sampled)
