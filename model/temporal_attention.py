@@ -19,13 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
-# TEMPO BEAST Phase 2: Correlation-based offset initialization
-from .correlation import (
-    CorrelationPyramid,
-    extract_correlation_peak_offset,
-    aggregate_temporal_offsets,
-)
-
 
 # ==============================================================================
 # Time Encoding
@@ -150,37 +143,9 @@ class DeformableTemporalAttention(nn.Module):
         
         # Gate for residual (learned, starts at 0)
         self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
-
+        
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        # =====================
-        # TEMPO BEAST Phase 2: Iterative Refinement + Correlation Init
-        # =====================
-        self.use_correlation_init = True
-        self.num_refine_iters = 3
-
-        # Correlation pyramid for motion-guided initialization
-        if self.use_correlation_init:
-            self.correlation_pyramid = CorrelationPyramid(
-                channels=channels,
-                num_levels=4,
-                search_radius=4
-            )
-
-        # Refinement MLPs (one per iteration except the last)
-        # Each iteration predicts a residual offset update
-        self.refinement_mlps = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(
-                    channels + num_heads * num_points * 2,  # features + flattened offsets
-                    channels, 3, padding=1
-                ),
-                nn.GELU(),
-                nn.Conv2d(channels, num_heads * num_points * 2, 1)
-            )
-            for _ in range(self.num_refine_iters - 1)
-        ])
-
+        
         self._init_weights()
     
     def _init_weights(self):
@@ -196,12 +161,7 @@ class DeformableTemporalAttention(nn.Module):
         nn.init.xavier_uniform_(self.out_proj[0].weight)
         nn.init.zeros_(self.out_proj[-1].weight)
         nn.init.zeros_(self.out_proj[-1].bias)
-
-        # Refinement MLPs start at zero (identity updates)
-        for mlp in self.refinement_mlps:
-            nn.init.zeros_(mlp[-1].weight)
-            nn.init.zeros_(mlp[-1].bias)
-
+    
     def forward(
         self,
         query: torch.Tensor,          # [B, C, H, W] - target features
@@ -222,55 +182,11 @@ class DeformableTemporalAttention(nn.Module):
         
         # Project query
         q = self.q_proj(query)  # [B, C, H, W]
-
-        # TEMPO BEAST Phase 2: Initialize offsets from correlation
-        # Use coarsest level (level 2) for speed - 1/4 resolution
-        if self.use_correlation_init and self.training and H >= 64:
-            # Compute correlation pyramid (only up to level 2 for speed)
-            with torch.no_grad():  # Don't backprop through correlation
-                # Downsample for faster correlation
-                query_coarse = F.avg_pool2d(query, 2, 2)
-                values_coarse = F.avg_pool2d(values.flatten(0, 1), 2, 2)
-                values_coarse = values_coarse.view(B, N, -1, H//2, W//2)
-
-                # Compute correlation at coarse level only
-                corr_pyramid = CorrelationPyramid(
-                    channels=query_coarse.shape[1],
-                    num_levels=1,  # Only one level for speed
-                    search_radius=2  # Smaller radius for speed
-                )
-                corr_pyramid = corr_pyramid.to(query.device).eval()
-                correlations = corr_pyramid(query_coarse, values_coarse)
-
-                # Extract offsets from coarse correlation
-                corr_offsets = extract_correlation_peak_offset(
-                    correlations[0],
-                    radius=2,
-                    temperature=0.1
-                )  # [B, N, H/2, W/2, 2]
-
-                # Upsample offsets to full resolution
-                corr_offsets = F.interpolate(
-                    corr_offsets.permute(0, 1, 4, 2, 3).flatten(0, 1),
-                    size=(H, W),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                corr_offsets = corr_offsets.view(B, N, 2, H, W).permute(0, 1, 3, 4, 2)
-
-            # Aggregate across observations using temporal weighting
-            temporal_weights = F.softmax(-rel_time.abs() * 2.0, dim=-1)  # [B, N]
-            base_offsets = aggregate_temporal_offsets(
-                corr_offsets,
-                temporal_weights,
-                self.num_heads,
-                self.num_points
-            )  # [B, heads, points, H, W, 2]
-        else:
-            # Predict base offsets from query features (original method)
-            base_offsets = self.offset_net(q)  # [B, heads*points*2, H, W]
-            base_offsets = base_offsets.view(B, self.num_heads, self.num_points, 2, H, W)
-            base_offsets = base_offsets.permute(0, 1, 2, 4, 5, 3)  # [B, heads, points, H, W, 2]
+        
+        # Predict base offsets from query features
+        base_offsets = self.offset_net(q)  # [B, heads*points*2, H, W]
+        base_offsets = base_offsets.view(B, self.num_heads, self.num_points, 2, H, W)
+        base_offsets = base_offsets.permute(0, 1, 2, 4, 5, 3)  # [B, heads, points, H, W, 2]
         
         # Predict base attention logits
         base_attn = self.attn_net(q)  # [B, heads*points, H, W]
@@ -334,7 +250,7 @@ class DeformableTemporalAttention(nn.Module):
                     grid_h = grid_h.clamp(-1, 1)
                     
                     # Sample
-                    padding_mode = "zeros" if torch.torch.backends.mps.is_available() else "border"
+                    padding_mode = "zeros" if torch.backends.mps.is_available() else "border"
                     sampled = F.grid_sample(
                         v_n[:, h],  # [B, head_dim, H, W]
                         grid_h,
@@ -372,8 +288,8 @@ class DeformableTemporalAttention(nn.Module):
         
         # Compute entropy for confidence
         entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1)  # [B, heads, H, W]
-        entropy = entropy.mean(dim=1, keepdim=True).unsqueeze(1)  # [B, 1, 1, H, W]
-        entropy = entropy.squeeze(2)  # [B, 1, H, W]
+        entropy = entropy.mean(dim=1, keepdim=True).unsqueeze(1)  # [B, 1, 1, H, W] (intermediate)
+        entropy = entropy.squeeze(2)  # [B, 1, H, W] (final shape)
         
         # Reshape attention weights back
         attn_weights = attn_weights.view(B, self.num_heads, H, W, N, self.num_points)
@@ -567,13 +483,19 @@ class MultiScaleTemporalFusion(nn.Module):
 class CrossScaleRefinement(nn.Module):
     """
     Refine fine-scale query using coarse-scale prediction.
+    
+    MODIFIED: Replaced PixelShuffle with bilinear upsampling to eliminate
+    vertical/horizontal stripe artifacts that occur when conv weights
+    produce uneven values across sub-pixel positions.
     """
     def __init__(self, coarse_channels: int, fine_channels: int):
         super().__init__()
         
+        # CHANGED: Bilinear + Conv instead of PixelShuffle to prevent stripe artifacts
         self.upsample = nn.Sequential(
-            nn.Conv2d(coarse_channels, fine_channels * 4, 1),
-            nn.PixelShuffle(2),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(coarse_channels, fine_channels, 3, padding=1),
+            nn.GELU(),
         )
         
         self.gate = nn.Sequential(

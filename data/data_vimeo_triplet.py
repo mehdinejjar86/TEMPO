@@ -81,8 +81,8 @@ class Vimeo90KTriplet(data.Dataset):
             return x1, x2, x3
         top  = random.randint(0, H - size)
         left = random.randint(0, W - size)
-        s, eH, eW = (slice(top, top+size), slice(left, left+size))
-        return x1[:, s, eW], x2[:, s, eW], x3[:, s, eW]
+        s_h, s_w = (slice(top, top+size), slice(left, left+size))
+        return x1[:, s_h, s_w], x2[:, s_h, s_w], x3[:, s_h, s_w]
 
     @staticmethod
     def _center_crop_3(x1: torch.Tensor, x2: torch.Tensor, x3: torch.Tensor, size: int):
@@ -93,8 +93,8 @@ class Vimeo90KTriplet(data.Dataset):
             return x1, x2, x3
         top  = (H - size) // 2
         left = (W - size) // 2
-        s, eH, eW = (slice(top, top+size), slice(left, left+size))
-        return x1[:, s, eW], x2[:, s, eW], x3[:, s, eW]
+        s_h, s_w = (slice(top, top+size), slice(left, left+size))
+        return x1[:, s_h, s_w], x2[:, s_h, s_w], x3[:, s_h, s_w]
 
     @staticmethod
     def _hflip_3(x1, x2, x3):

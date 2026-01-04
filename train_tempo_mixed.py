@@ -1,15 +1,14 @@
 """
-TEMPO Training System
-=====================
-Temporal Multi-View Frame Synthesis
+TEMPO Mixed Training System
+============================
+Temporal Multi-View Frame Synthesis with Mixed Vimeo (N=2) + X4K (N=4) Training
 
 Features:
-- WandB + TensorBoard logging
-- Organized run management
-- Best model checkpointing
-- Validation sample generation
-- Comprehensive metrics tracking
-- Resume capability
+- Mixed-dataset training with pure batches (no N mixing within batches)
+- Separate validation for Vimeo and X4K datasets
+- Configurable dataset ratios
+- STEP-based X4K sampling for controllable motion magnitude
+- All other features from standard TEMPO training
 """
 import argparse
 from pathlib import Path
@@ -19,7 +18,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.amp import autocast, GradScaler, autocast_mode
 
 import numpy as np
@@ -39,6 +38,8 @@ except ImportError:
 from model.tempo import build_tempo
 from model.loss.tempo_loss import build_tempo_loss, LossScheduler, MetricTracker
 from data.data_vimeo_triplet import Vimeo90KTriplet, vimeo_collate
+from data.data_x4k1000 import X4K1000Dataset, x4k_collate
+from data.samplers import PureBatchSampler, DistributedPureBatchSampler
 from config.default import TrainingConfig
 from config.manager import RunManager
 from config.dpp import setup_distributed_training, cleanup_distributed_training, is_main_process
@@ -49,16 +50,17 @@ import torch.distributed as dist
 from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
 
 
-class Trainer:
-    """Main training orchestrator"""
-    
-    def __init__(self, config: TrainingConfig):
+class MixedTrainer:
+    """Training orchestrator for mixed Vimeo+X4K datasets"""
+
+    def __init__(self, config: TrainingConfig, x4k_config: Dict):
         self.config = config
-        
+        self.x4k_config = x4k_config
+
         # DDP Setup
         self.is_distributed = setup_distributed_training()
         self.is_main_process = is_main_process()
-        
+
         # Set device based on local rank
         if self.is_distributed:
             self.device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
@@ -71,8 +73,8 @@ class Trainer:
         # AMP setup
         self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
         self.amp_dtype = (
-            torch.bfloat16 if config.amp_dtype.lower() == "bf16" 
-            else torch.float16 if config.amp_dtype.lower() == "fp16" 
+            torch.bfloat16 if config.amp_dtype.lower() == "bf16"
+            else torch.float16 if config.amp_dtype.lower() == "fp16"
             else torch.float32
         )
         self.use_autocast = (
@@ -84,16 +86,16 @@ class Trainer:
             self.scaler = GradScaler(device_type="cuda")
         else:
             self.scaler = None
-        
+
         # Run manager (only main process)
         if self.is_main_process:
             self.run_manager = RunManager(config)
         else:
             self.run_manager = None
-            
+
         print(f"🧪 AMP: use_autocast={self.use_autocast}, device={self.amp_device_type}, "
               f"dtype={self.amp_dtype}, scaler={'yes' if self.scaler else 'no'}")
-        
+
         # Build model
         print("🏗️ Building model...")
         self.model = build_tempo(
@@ -110,7 +112,7 @@ class Trainer:
         # Wrap for DDP
         if self.is_distributed:
             self.model = DDP(self.model, device_ids=[self.device.index], find_unused_parameters=True)
-        
+
         if config.compile_model and hasattr(torch, 'compile'):
             print("  ⚡ Compiling model with PyTorch 2.0 (max-autotune)...")
             self.model = torch.compile(
@@ -118,11 +120,11 @@ class Trainer:
                 mode="max-autotune",  # Try all CUDA kernels, pick fastest
                 fullgraph=True,       # Compile entire forward pass
             )
-            
+
         # Loss
         self.loss_fn = build_tempo_loss(config.loss_config).to(self.device)
         self.loss_scheduler = LossScheduler(self.loss_fn)
-        
+
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -130,26 +132,26 @@ class Trainer:
             weight_decay=config.weight_decay,
             betas=(0.9, 0.999)
         )
-        
+
         # Data
         self._setup_data()
-        
+
         # LR scheduler
         self.lr_scheduler = self._build_lr_scheduler()
-        
+
         # Training state
         self.global_step = 0
         self.epoch = 0
         self.best_psnr = 0.0
-        
+
         # Resume if specified
         if config.resume:
             self._load_checkpoint(config.resume)
-            
+
         # Print info
         if self.is_main_process:
             self._print_model_info()
-        
+
     def _build_lr_scheduler(self):
         if self.config.lr_scheduler == "cosine":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -162,12 +164,12 @@ class Trainer:
                 self.optimizer, step_size=30, gamma=0.5
             )
         return None
-            
+
     def _setup_data(self):
         print("📊 Loading datasets...")
-        
-        # Training
-        train_dataset = Vimeo90KTriplet(
+
+        # ===== Vimeo Training Dataset =====
+        vimeo_train = Vimeo90KTriplet(
             root=self.config.data_root,
             split="train",
             mode="mix",
@@ -175,21 +177,57 @@ class Trainer:
             aug_flip=False,
         )
 
-        self.train_sampler = DistributedSampler(train_dataset) if self.is_distributed else None
-        
+        # ===== X4K Training Dataset =====
+        x4k_train = X4K1000Dataset(
+            root=self.x4k_config['root'],
+            split="train",
+            step=self.x4k_config['step'],
+            crop_size=self.x4k_config['crop_size'],
+            aug_flip=True,
+            n_frames=4,
+        )
+
+        # ===== Concatenate Datasets =====
+        train_dataset = ConcatDataset([vimeo_train, x4k_train])
+
+        dataset_sizes = [len(vimeo_train), len(x4k_train)]
+        vimeo_ratio = self.x4k_config['vimeo_ratio']
+        x4k_ratio = 1.0 - vimeo_ratio
+
+        print(f"  Vimeo: {len(vimeo_train):,} samples (N=2)")
+        print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEP={self.x4k_config['step']})")
+        print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {x4k_ratio:.0%} X4K")
+
+        # ===== Pure Batch Sampler =====
+        if self.is_distributed:
+            self.train_sampler = DistributedPureBatchSampler(
+                dataset_sizes=dataset_sizes,
+                batch_size=self.config.batch_size,
+                ratios=[vimeo_ratio, x4k_ratio],
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            self.train_sampler = PureBatchSampler(
+                dataset_sizes=dataset_sizes,
+                batch_size=self.config.batch_size,
+                ratios=[vimeo_ratio, x4k_ratio],
+                shuffle=True,
+                drop_last=True,
+            )
+
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=(self.train_sampler is None),
-            sampler=self.train_sampler,
+            batch_sampler=self.train_sampler,
             num_workers=self.config.num_workers,
-            collate_fn=vimeo_collate,
+            collate_fn=self._mixed_collate,
             pin_memory=True,
-            drop_last=True
         )
-        
-        # Validation
-        val_dataset = Vimeo90KTriplet(
+
+        # ===== Validation Dataset (Vimeo Only) =====
+        vimeo_val = Vimeo90KTriplet(
             root=self.config.data_root,
             split="test",
             mode="interp",
@@ -197,31 +235,42 @@ class Trainer:
             center_crop_eval=False
         )
 
-        self.val_sampler = DistributedSampler(val_dataset, shuffle=False) if self.is_distributed else None
-        
+        vimeo_sampler = DistributedSampler(vimeo_val, shuffle=False) if self.is_distributed else None
+
         self.val_loader = DataLoader(
-            val_dataset,
+            vimeo_val,
             batch_size=1,
             shuffle=False,
             num_workers=4,
-            sampler=self.val_sampler,
+            sampler=vimeo_sampler,
             collate_fn=vimeo_collate,
             pin_memory=True
         )
-        
-        print(f"  Training samples: {len(train_dataset):,}")
-        print(f"  Validation samples: {len(val_dataset):,}")
-        
+
+        print(f"  Validation: {len(vimeo_val):,} Vimeo samples")
+
+    def _mixed_collate(self, batch):
+        """Auto-detect dataset type and route to correct collate function"""
+        # Check N from first sample
+        N = batch[0][0].shape[0]  # frames: [N,3,H,W]
+
+        if N == 2:
+            return vimeo_collate(batch)
+        elif N == 4:
+            return x4k_collate(batch)
+        else:
+            raise ValueError(f"Unexpected N={N} frames in batch")
+
     def _print_model_info(self):
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        
+
         # Get component breakdown
         model_ref = self.model.module if self.is_distributed else self.model
         enc_params = sum(p.numel() for p in model_ref.encoder.parameters())
         dec_params = sum(p.numel() for p in model_ref.decoder.parameters())
         fus_params = sum(p.numel() for p in model_ref.fusion.parameters())
-        
+
         print(f"\n📊 Model Statistics:")
         print(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
         print(f"  Trainable: {trainable_params:,}")
@@ -229,14 +278,14 @@ class Trainer:
         print(f"    Encoder (ConvNeXt):      {enc_params/1e6:.2f}M")
         print(f"    Fusion (CrossAttention): {fus_params/1e6:.2f}M")
         print(f"    Decoder (NAFNet):        {dec_params/1e6:.2f}M")
-        
+
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
         metric_tracker = MetricTracker()
-        
+
         if self.is_distributed:
             dist.barrier()
-        
+
         iterable = self.train_loader
         pbar = None
         if self.is_main_process:
@@ -249,19 +298,19 @@ class Trainer:
                 colour="cyan"
             )
             iterable = pbar
-        
+
         for batch_idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             frames = frames.to(self.device, non_blocking=True)
             anchor_times = anchor_times.to(self.device, non_blocking=True)
             target_time = target_time.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-            
+
             # Warmup
             if self.global_step < self.config.warmup_steps:
                 lr_scale = (self.global_step + 1) / self.config.warmup_steps
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = self.config.learning_rate * lr_scale
-                    
+
             self.loss_scheduler.update(self.global_step)
 
             # Forward
@@ -286,46 +335,52 @@ class Trainer:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                 self.optimizer.step()
-                
+
             if self.lr_scheduler and self.global_step >= self.config.warmup_steps:
                 self.lr_scheduler.step()
-            
+
             metric_tracker.update(metrics)
             metrics['lr'] = self.optimizer.param_groups[0]['lr']
-            
+
+            # Detect batch type for logging
+            N = frames.shape[1]
+            batch_type = "vimeo" if N == 2 else "x4k"
+
             if self.is_main_process and pbar is not None:
                 pbar.set_postfix({
+                    'type': batch_type,
                     'loss': f"{metrics['total']:.4f}",
                     'l1': f"{metrics.get('l1', 0):.3f}",
                     'psnr': f"{metrics.get('psnr', 0):.2f}",
                     'lr': f"{metrics['lr']:.1e}"
                 })
-            
+
             # Logging
             if self.global_step % self.config.log_interval == 0 and self.is_main_process:
                 avg_metrics = metric_tracker.get_averages()
                 if self.run_manager:
                     self.run_manager.log_metrics(avg_metrics, self.global_step, "train")
                 metric_tracker.reset()
-            
+
             # Validation
             if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
                 if self.is_distributed:
                     dist.barrier()
-                    
+
                 val_metrics = self.validate()
-                
+
                 if self.is_main_process and self.run_manager:
                     self.run_manager.log_metrics(val_metrics, self.global_step, "val")
-                    
+
+                    # Update best PSNR
                     if val_metrics.get('psnr', 0) > self.best_psnr:
                         self.best_psnr = val_metrics['psnr']
-                
+
                 self.model.train()
-                
+
                 if self.is_distributed:
                     dist.barrier()
-            
+
             # Checkpointing
             if self.global_step % self.config.save_interval == 0 and self.global_step > 0 and self.is_main_process:
                 if self.run_manager:
@@ -336,111 +391,76 @@ class Trainer:
                         is_main_process=self.is_main_process,
                         is_distributed=self.is_distributed,
                     )
-            
+
             self.global_step += 1
-        
+
         return metric_tracker.get_averages()
-        
+
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
+        """Validate on Vimeo dataset"""
         self.model.eval()
         self.ssim_metric.reset()
-        
+
         total_psnr = 0.0
         total_ssim_sum = 0.0
         num_samples = 0
 
         model_to_eval = self.model.module if self.is_distributed else self.model
-        
+
         iterable = self.val_loader
         pbar = None
         if self.is_main_process:
             pbar = tqdm(self.val_loader, desc="Validating", unit="sample",
                        ncols=120, leave=False, colour="green")
             iterable = pbar
-        
+
         for idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             frames = frames.to(self.device, non_blocking=True)
             anchor_times = anchor_times.to(self.device, non_blocking=True)
             target_time = target_time.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-            
+
             pred, aux = model_to_eval(frames, anchor_times, target_time)
             pred = pred.clamp(0, 1)
-            
+
             mse = F.mse_loss(pred, target)
             psnr = -10 * torch.log10(mse + 1e-8)
             total_psnr += psnr.item() * frames.size(0)
             num_samples += frames.size(0)
-            
+
             self.ssim_metric.update(pred, target)
             batch_ssim = self.ssim_metric(pred, target).item()
             total_ssim_sum += batch_ssim * frames.size(0)
-            
+
             if self.is_main_process and pbar is not None:
                 pbar.set_postfix({
                     'psnr': f"{psnr.item():.2f}",
                     'ssim': f"{batch_ssim:.4f}",
                     'avg_psnr': f"{total_psnr/num_samples:.2f}"
                 })
-                
-                # Save samples
-                num_val_batches = len(self.val_loader)
-                sample_indices = np.linspace(0, num_val_batches - 1,
-                                            min(self.config.n_val_samples, num_val_batches),
-                                            dtype=int)
-                
-                if idx in sample_indices and self.run_manager:
-                    viz_dict = {
-                        'frame0': frames[0, 0], 
-                        'frame1': frames[0, -1], 
-                        'target': target[0],
-                        'pred': pred[0], 
-                        'error': (pred[0] - target[0]).abs().mean(0, True).repeat(3,1,1),
-                        'conf': aux['confidence'][0].repeat(3,1,1) if 'confidence' in aux else torch.zeros_like(pred[0])
-                    }
-                    save_path = self.run_manager.sample_dir / f"step_{self.global_step:06d}_sample_{idx:03d}.png"
-                    self._save_image_grid(viz_dict, save_path)
-                    self.run_manager.log_images(viz_dict, self.global_step, "val")
 
         # Aggregate
         if self.is_distributed:
-            local_results = torch.tensor([total_psnr, total_ssim_sum, float(num_samples)], 
+            local_results = torch.tensor([total_psnr, total_ssim_sum, float(num_samples)],
                                         dtype=torch.float64, device=self.device)
             dist.all_reduce(local_results, op=dist.ReduceOp.SUM)
             total_psnr = local_results[0].item()
             total_ssim_sum = local_results[1].item()
             num_samples = int(local_results[2].item())
-        
+
         avg_psnr = total_psnr / max(1, num_samples)
         avg_ssim = self.ssim_metric.compute().item()
-        
+
         if self.is_main_process:
             print(f"\n  📈 Validation: PSNR={avg_psnr:.2f} dB, SSIM={avg_ssim:.4f}")
-        
+
         return {'psnr': avg_psnr, 'ssim': avg_ssim}
-    
-    def _save_image_grid(self, images: Dict[str, torch.Tensor], path: Path):
-        keys = ['frame0', 'frame1', 'target', 'pred', 'error', 'conf']
-        imgs = []
-        for k in keys:
-            if k in images:
-                img = images[k].clamp(0, 1)
-                img = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
-                imgs.append(img)
-                
-        if imgs:
-            h, w = imgs[0].shape[:2]
-            grid = np.zeros((h*2, w*3, 3), dtype=np.uint8)
-            for i, img in enumerate(imgs):
-                row, col = i // 3, i % 3
-                grid[row*h:(row+1)*h, col*w:(col+1)*w] = img
-            Image.fromarray(grid).save(path)
-            
+
     def _load_checkpoint(self, path: str):
         print(f"📂 Loading checkpoint: {path}")
         checkpoint = torch.load(path, map_location=self.device)
-        
+
         state_dict = checkpoint['model_state']
         if self.is_distributed:
             if not any(key.startswith('module.') for key in state_dict.keys()):
@@ -448,51 +468,51 @@ class Trainer:
         else:
             if any(key.startswith('module.') for key in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        
+
         self.model.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        
+
         if checkpoint.get('scheduler_state') and self.lr_scheduler:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler_state'])
-            
+
         self.global_step = checkpoint.get('step', 0)
         self.epoch = checkpoint.get('epoch', 0)
         self.best_psnr = checkpoint.get('best_metric', 0)
-        
+
         print(f"  Resumed from step {self.global_step}, epoch {self.epoch}")
-        
+
     def train(self):
         if self.is_main_process:
-            print("\n🚀 Starting training...\n")
-        
+            print("\n🚀 Starting mixed training (Vimeo + X4K)...\n")
+
         try:
             for epoch in range(self.epoch, self.config.epochs):
                 self.epoch = epoch
-                
-                if self.is_distributed and self.train_sampler is not None:
+
+                if self.is_distributed and hasattr(self.train_sampler, 'set_epoch'):
                     self.train_sampler.set_epoch(epoch)
-                
+
                 epoch_metrics = self.train_epoch()
-                
+
                 if self.is_distributed:
                     dist.barrier()
-                
+
                 val_metrics = self.validate()
-                
+
                 if self.is_distributed:
                     dist.barrier()
-                
+
                 if self.is_main_process:
                     is_best = val_metrics['psnr'] > self.best_psnr
                     if is_best:
                         self.best_psnr = val_metrics['psnr']
-                        
+
                     print(f"\n📊 Epoch {epoch+1} Summary:")
                     print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
                     print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
                     print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
                     print(f"  Best PSNR: {self.best_psnr:.2f} dB")
-                    
+
                     if self.run_manager:
                         self.run_manager.save_checkpoint(
                             self.model, self.optimizer, self.lr_scheduler,
@@ -501,7 +521,7 @@ class Trainer:
                             is_main_process=self.is_main_process,
                             is_distributed=self.is_distributed,
                         )
-                
+
         except KeyboardInterrupt:
             if self.is_main_process:
                 print("\n\n⚠️ Training interrupted by user")
@@ -522,7 +542,7 @@ class Trainer:
                     )
                     self.run_manager.close()
                     print(f"\n✅ Training complete! Results saved to: {self.run_manager.run_dir}")
-            
+
             if self.is_distributed:
                 cleanup_distributed_training()
 
@@ -537,13 +557,24 @@ def main():
     # Create default config (single source of truth)
     default_config = TrainingConfig()
 
-    parser = argparse.ArgumentParser(description="TEMPO Training")
+    parser = argparse.ArgumentParser(description="TEMPO Mixed Training (Vimeo + X4K)")
 
     # Basic settings (no defaults - use TrainingConfig defaults)
-    parser.add_argument("--data_root", type=str)
+    parser.add_argument("--data_root", type=str,
+                       help="Path to Vimeo90K dataset")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--lr", type=float, dest='learning_rate')
+
+    # X4K dataset settings (not part of TrainingConfig, so provide defaults here)
+    parser.add_argument("--x4k_root", type=str, default="/Users/nightstalker/Projects/datasets",
+                       help="Path to X4K1000 dataset")
+    parser.add_argument("--x4k_step", type=int, default=1,
+                       help="STEP parameter for X4K (1=small motion, 2=medium, 3=large)")
+    parser.add_argument("--x4k_crop", type=int, default=512,
+                       help="Crop size for X4K (512 or 768)")
+    parser.add_argument("--vimeo_ratio", type=float, default=0.5,
+                       help="Fraction of batches from Vimeo (0.0-1.0)")
 
     # Model architecture
     parser.add_argument("--base_channels", type=int)
@@ -571,9 +602,17 @@ def main():
 
     args = parser.parse_args()
 
-    # Build override dict from explicitly provided args
+    # Separate X4K-specific args (not part of TrainingConfig)
+    x4k_args = {
+        'x4k_root', 'x4k_step', 'x4k_crop', 'vimeo_ratio'
+    }
+
+    # Build override dict from explicitly provided TrainingConfig args
     overrides = {}
     for key, value in vars(args).items():
+        if key in x4k_args:
+            continue  # Skip X4K-specific args
+
         if value is not None:
             # For store_true flags, only override if True (explicitly set)
             if isinstance(value, bool):
@@ -582,10 +621,24 @@ def main():
             else:
                 overrides[key] = value
 
+    # Apply default exp_name and notes if not provided
+    if 'exp_name' not in overrides:
+        overrides['exp_name'] = f"mixed_vimeo_x4k_step{args.x4k_step}"
+    if 'notes' not in overrides:
+        overrides['notes'] = f"Mixed training: Vimeo (N=2) + X4K (N=4, STEP={args.x4k_step})"
+
     # Apply overrides to default config
     config = replace(default_config, **overrides)
 
-    trainer = Trainer(config)
+    # Build X4K config dict
+    x4k_config = {
+        'root': args.x4k_root,
+        'step': args.x4k_step,
+        'crop_size': args.x4k_crop,
+        'vimeo_ratio': args.vimeo_ratio,
+    }
+
+    trainer = MixedTrainer(config, x4k_config)
     trainer.train()
 
 

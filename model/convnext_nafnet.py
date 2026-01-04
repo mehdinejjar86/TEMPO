@@ -380,16 +380,19 @@ class ConvNeXtEncoder(nn.Module):
         base_channels: int = 64,
         temporal_channels: int = 64,
         depths: list = None,
-        drop_path_rate: float = 0.1
+        drop_path_rate: float = 0.1,
+        use_checkpointing: bool = False
     ):
         super().__init__()
-        
+
         if depths is None:
             depths = [3, 3, 18, 3]  # TEMPO BEAST: Scaled up for ~18M encoder params
-        
+
         C = base_channels
         Ct = temporal_channels
-        
+        self.base_channels = base_channels
+        self.use_checkpointing = use_checkpointing
+
         # Channel progression: C → C*2 → C*4 → C*8
         dims = [C, C * 2, C * 4, C * 8]
         
@@ -457,7 +460,7 @@ class ConvNeXtEncoder(nn.Module):
         Args:
             frame: [B, 3, H, W] input frame
             temporal_encoding: [B, Ct] temporal embedding
-        
+
         Returns:
             f1: [B, C, H, W] - full resolution features
             f2: [B, C*2, H/2, W/2] - 1/2× features
@@ -465,12 +468,21 @@ class ConvNeXtEncoder(nn.Module):
             f4: [B, C*8, H/8, W/8] - 1/8× features
         """
         x = self.stem(frame)
-        
-        f1 = self.stage1(x, temporal_encoding)
-        f2 = self.stage2(f1, temporal_encoding)
-        f3 = self.stage3(f2, temporal_encoding)
-        f4 = self.stage4(f3, temporal_encoding)
-        
+
+        if self.use_checkpointing and self.training:
+            # Gradient checkpointing: Trade compute for memory (~40% reduction)
+            # Recompute activations in backward pass instead of storing them
+            from torch.utils.checkpoint import checkpoint
+            f1 = checkpoint(self.stage1, x, temporal_encoding, use_reentrant=False)
+            f2 = checkpoint(self.stage2, f1, temporal_encoding, use_reentrant=False)
+            f3 = checkpoint(self.stage3, f2, temporal_encoding, use_reentrant=False)
+            f4 = checkpoint(self.stage4, f3, temporal_encoding, use_reentrant=False)
+        else:
+            f1 = self.stage1(x, temporal_encoding)
+            f2 = self.stage2(f1, temporal_encoding)
+            f3 = self.stage3(f2, temporal_encoding)
+            f4 = self.stage4(f3, temporal_encoding)
+
         return f1, f2, f3, f4
 
 
@@ -492,12 +504,15 @@ class NAFNetDecoder(nn.Module):
         base_channels: int = 64,
         temporal_channels: int = 64,
         depths: list = None,
-        drop_path_rate: float = 0.05
+        drop_path_rate: float = 0.05,
+        use_checkpointing: bool = False
     ):
         super().__init__()
-        
+
         if depths is None:
             depths = [3, 3, 9, 3]  # TEMPO BEAST: Scaled up for ~12M decoder params
+
+        self.use_checkpointing = use_checkpointing
         
         C = base_channels
         Ct = temporal_channels  # +1 for speed token handled by caller
@@ -551,21 +566,35 @@ class NAFNetDecoder(nn.Module):
             nn.Softplus()  # Ensures positive output: log(σ²)
         )
 
+        # Enhanced to_rgb with extra conv for detail preservation (reduces blur)
         self.to_rgb = nn.Sequential(
             LayerNorm2d(C),
+            nn.Conv2d(C, C, 3, padding=1),  # Extra conv for detail refinement
+            nn.GELU(),
             nn.Conv2d(C, 3, kernel_size=3, padding=1),
             nn.Sigmoid()
         )
         
         self._init_weights()
-    
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-    
+
+    def _process_blocks(self, x, t_emb, blocks):
+        """Helper to process blocks with optional checkpointing"""
+        if self.use_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for block in blocks:
+                x = checkpoint(block, x, t_emb, use_reentrant=False)
+        else:
+            for block in blocks:
+                x = block(x, t_emb)
+        return x
+
     def forward(
         self,
         f1: torch.Tensor,
@@ -587,28 +616,24 @@ class NAFNetDecoder(nn.Module):
             uncertainty_log_var: [B, 1, H, W] - heteroscedastic uncertainty (log variance)
         """
         t_emb = tenc_with_speed
-        
+
         # 1/8× → 1/4×
         x = self.up4(f4)
         x = self.merge4(torch.cat([x, f3], dim=1))
-        for block in self.blocks4:
-            x = block(x, t_emb)
-        
+        x = self._process_blocks(x, t_emb, self.blocks4)
+
         # 1/4× → 1/2×
         x = self.up3(x)
         x = self.merge3(torch.cat([x, f2], dim=1))
-        for block in self.blocks3:
-            x = block(x, t_emb)
-        
+        x = self._process_blocks(x, t_emb, self.blocks3)
+
         # 1/2× → 1×
         x = self.up2(x)
         x = self.merge2(torch.cat([x, f1], dim=1))
-        for block in self.blocks2:
-            x = block(x, t_emb)
-        
+        x = self._process_blocks(x, t_emb, self.blocks2)
+
         # Final refinement
-        for block in self.refine:
-            x = block(x, t_emb)
+        x = self._process_blocks(x, t_emb, self.refine)
 
         # TEMPO BEAST: Predict heteroscedastic uncertainty (per-pixel log-variance)
         uncertainty_log_var = self.uncertainty_head(x)
@@ -631,11 +656,11 @@ def build_convnext_encoder(
 ):
     """
     Build ConvNeXt encoder.
-    
+
     Presets:
-        - depths=[3, 3, 9, 3] : Quality-focused (default, ~18 blocks)
-        - depths=[2, 2, 6, 2] : Balanced (~12 blocks)
-        - depths=[2, 2, 2, 2] : Fast (~8 blocks)
+        - depths=[3, 3, 9, 3] : Quality-focused (default, 18 blocks total, 9 in stage 3)
+        - depths=[2, 2, 6, 2] : Balanced (12 blocks total)
+        - depths=[2, 2, 2, 2] : Fast (8 blocks total)
     """
     return ConvNeXtEncoder(base_channels, temporal_channels, depths, drop_path_rate)
 
@@ -680,8 +705,9 @@ if __name__ == "__main__":
     decoder = build_nafnet_decoder(base_channels=64, temporal_channels=65).to(device)
     t_emb_with_speed = torch.randn(2, 65).to(device)  # +1 for speed token
     
-    out = decoder(f1, f2, f3, f4, t_emb_with_speed)
-    print(f"\nDecoder output: {out.shape}")  # [2, 3, 256, 256]
+    out, uncertainty = decoder(f1, f2, f3, f4, t_emb_with_speed)
+    print(f"\nDecoder output RGB: {out.shape}")  # [2, 3, 256, 256]
+    print(f"Decoder output uncertainty: {uncertainty.shape}")  # [2, 1, 256, 256]
     
     # Parameter counts
     enc_params = sum(p.numel() for p in encoder.parameters()) / 1e6

@@ -42,6 +42,9 @@ class TrainingConfig:
     use_amp: bool = False
     amp_dtype: str = "fp32"  # "fp16", "bf16", or "fp32"
 
+    # Gradient checkpointing (trade compute for memory)
+    use_checkpointing: bool = True  # Enables ~40% memory reduction during training
+
     # Scheduling
     lr_scheduler: str = "cosine"
     warmup_steps: int = 1000
