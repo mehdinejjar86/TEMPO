@@ -74,7 +74,7 @@ class DeformableTemporalAttention(nn.Module):
         channels: int,
         temporal_channels: int,
         num_heads: int = 8,
-        num_points: int = 4,
+        num_points: int = 6,  # TEMPO BEAST: Increased from 4 to 6 (48 total samples)
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -94,9 +94,12 @@ class DeformableTemporalAttention(nn.Module):
         # =====================
         # Offset prediction (WHERE to look)
         # Time-conditioned: offset depends on temporal distance
+        # TEMPO BEAST: Added extra capacity for better motion estimation
         # =====================
         self.offset_net = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels),  # Spatial context
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),  # Added: Extra intermediate layer
             nn.GELU(),
             nn.Conv2d(channels, channels // 2, 1),
             nn.GELU(),
@@ -111,11 +114,14 @@ class DeformableTemporalAttention(nn.Module):
         
         # =====================
         # Attention prediction (HOW MUCH to weight)
+        # TEMPO BEAST: Added spatial context layer for better attention
         # =====================
         self.attn_net = nn.Sequential(
             nn.Conv2d(channels, channels // 2, 1),
             nn.GELU(),
-            nn.Conv2d(channels // 2, num_heads * num_points, 1),
+            nn.Conv2d(channels // 2, channels // 4, 3, padding=1),  # Added: Spatial context
+            nn.GELU(),
+            nn.Conv2d(channels // 4, num_heads * num_points, 1),
         )
         
         # Time bias for attention (closer observations → higher weight)
@@ -244,7 +250,7 @@ class DeformableTemporalAttention(nn.Module):
                     grid_h = grid_h.clamp(-1, 1)
                     
                     # Sample
-                    padding_mode = "zeros" if torch.torch.backends.mps.is_available() else "border"
+                    padding_mode = "zeros" if torch.backends.mps.is_available() else "border"
                     sampled = F.grid_sample(
                         v_n[:, h],  # [B, head_dim, H, W]
                         grid_h,
@@ -282,8 +288,8 @@ class DeformableTemporalAttention(nn.Module):
         
         # Compute entropy for confidence
         entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1)  # [B, heads, H, W]
-        entropy = entropy.mean(dim=1, keepdim=True).unsqueeze(1)  # [B, 1, 1, H, W]
-        entropy = entropy.squeeze(2)  # [B, 1, H, W]
+        entropy = entropy.mean(dim=1, keepdim=True).unsqueeze(1)  # [B, 1, 1, H, W] (intermediate)
+        entropy = entropy.squeeze(2)  # [B, 1, H, W] (final shape)
         
         # Reshape attention weights back
         attn_weights = attn_weights.view(B, self.num_heads, H, W, N, self.num_points)
@@ -477,13 +483,19 @@ class MultiScaleTemporalFusion(nn.Module):
 class CrossScaleRefinement(nn.Module):
     """
     Refine fine-scale query using coarse-scale prediction.
+    
+    MODIFIED: Replaced PixelShuffle with bilinear upsampling to eliminate
+    vertical/horizontal stripe artifacts that occur when conv weights
+    produce uneven values across sub-pixel positions.
     """
     def __init__(self, coarse_channels: int, fine_channels: int):
         super().__init__()
         
+        # CHANGED: Bilinear + Conv instead of PixelShuffle to prevent stripe artifacts
         self.upsample = nn.Sequential(
-            nn.Conv2d(coarse_channels, fine_channels * 4, 1),
-            nn.PixelShuffle(2),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(coarse_channels, fine_channels, 3, padding=1),
+            nn.GELU(),
         )
         
         self.gate = nn.Sequential(

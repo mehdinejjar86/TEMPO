@@ -3,3 +3,5 @@ datasets/*
 .DS_Store
 runs/*
 .vscode/*
+.ipynb_checkpoints
+.claude

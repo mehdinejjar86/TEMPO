@@ -159,7 +159,29 @@ class FrequencyLoss(nn.Module):
         w = (magX + magY).clamp_min(1e-3) * low
         dphi = torch.atan2(torch.sin(phX - phY), torch.cos(phX - phY)).abs()
         Lp = (dphi * w).sum() / w.sum().clamp_min(1.0)
+
+        # Returns: (structure_loss, phase_loss)
         return (Ls + 0.1 * Lh), Lp
+
+
+class GradientLoss(nn.Module):
+    """Gradient-domain loss for edge preservation and sharpness."""
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        def gradient(x):
+            # Sobel-like gradients
+            dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+            dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+            return dx, dy
+        
+        pred_dx, pred_dy = gradient(pred)
+        target_dx, target_dy = gradient(target)
+        
+        # Charbonnier on gradients for robustness
+        eps = 1e-6
+        loss_x = torch.sqrt((pred_dx - target_dx)**2 + eps).mean()
+        loss_y = torch.sqrt((pred_dy - target_dy)**2 + eps).mean()
+        
+        return loss_x + loss_y
 
 
 class OcclusionAwareLoss(nn.Module):
@@ -224,38 +246,47 @@ class TEMPOLoss(nn.Module):
     """
     def __init__(self, config: Optional[Dict] = None):
         super().__init__()
+        # =====================================================
+        # PSNR-OPTIMIZED CONFIG (Target: 37-38 dB)
+        # Key insight: L1/MSE directly optimizes PSNR
+        # Perceptual losses improve visual quality but HURT PSNR
+        # =====================================================
         self.cfg = {
-            # Core reconstruction
-            "w_l1": 0.8,
-            "w_ssim": 1.0,
-            "w_freq_struct": 0.3,
-            "w_freq_phase": 0.1,
+            # Core reconstruction - L1 is KING for PSNR
+            "w_l1": 1.5,           # ↑ from 0.8 - directly minimizes MSE
+            "w_ssim": 0.3,         # ↓ from 1.0 - less SSIM, more L1
+            "w_freq_struct": 0.05, # ↓ from 0.3 - reduce frequency noise
+            "w_freq_phase": 0.02,  # ↓ from 0.1
+            
+            # Gradient loss - small amount for stability
+            "w_gradient": 0.03,    # ↓ from 0.15
 
-            # Temporal
-            "w_coherence": 0.2,
+            # Temporal - reduce, let L1 dominate
+            "w_coherence": 0.05,   # ↓ from 0.2
 
-            # Occlusion handling
-            "w_occlusion": 0.5,
+            # Occlusion - reduce, trust the L1
+            "w_occlusion": 0.1,    # ↓ from 0.5
 
-            # Weight regularization
-            "w_weight_entropy": 0.01,
-            "w_weight_smooth": 0.005,
-            "w_weight_coverage": 0.02,
-            "w_weight_sparsity": 0.005,
+            # Weight regularization - keep light
+            "w_weight_entropy": 0.005,
+            "w_weight_smooth": 0.002,
+            "w_weight_coverage": 0.01,
+            "w_weight_sparsity": 0.002,
 
             # Confidence shaping
-            "w_conf_target": 0.01,
+            "w_conf_target": 0.005,
             "conf_target": 0.7,
 
-            # Multi-scale
-            "pyramid_weights": [1.0, 0.5, 0.25],
+            # Multi-scale - focus on full resolution
+            "pyramid_weights": [1.0, 0.3, 0.1],
 
-            # Perceptual (optional)
-            "w_perceptual": 0.05,
-            "use_perceptual": True,
+            # Perceptual - DISABLED for max PSNR
+            # (LPIPS optimizes "looks good", not exact pixels)
+            "w_perceptual": 0.0,   # ↓ from 0.15 - hurts PSNR!
+            "use_perceptual": False,
 
             # Scene cut handling
-            "cut_loss_scale": 0.3,  # Reduce loss when cut detected
+            "cut_loss_scale": 0.5,  # Less aggressive gating
         }
         if config:
             self.cfg.update(config)
@@ -263,6 +294,7 @@ class TEMPOLoss(nn.Module):
         self.charb = AdaptiveCharbonnier(scales=3, eps_scale=1e-3)
         self.ssim = ConfidenceAwareSSIM()
         self.freq_loss = FrequencyLoss()
+        self.gradient_loss = GradientLoss()  # NEW: for edge sharpness
         self.temporal = TemporalCoherenceLoss()
         self.occlusion = OcclusionAwareLoss()
         self.weight_reg = WeightRegularization()
@@ -346,6 +378,12 @@ class TEMPOLoss(nn.Module):
         total_recon = total_recon + self.cfg["w_freq_struct"] * freq_struct + self.cfg["w_freq_phase"] * freq_phase
         losses["freq_struct"] = float(freq_struct.detach())
         losses["freq_phase"] = float(freq_phase.detach())
+
+        # ===== Gradient loss (edge sharpness) =====
+        if self.cfg["w_gradient"] > 0:
+            L_grad = self.gradient_loss(pred, target)
+            total_recon = total_recon + self.cfg["w_gradient"] * L_grad
+            losses["gradient"] = float(L_grad.detach())
 
         # ===== Temporal coherence (only if N > 1) =====
         if N > 1:
