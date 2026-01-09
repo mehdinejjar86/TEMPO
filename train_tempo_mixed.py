@@ -39,7 +39,9 @@ from model.tempo import build_tempo
 from model.loss.tempo_loss import build_tempo_loss, LossScheduler, MetricTracker
 from data.data_vimeo_triplet import Vimeo90KTriplet, vimeo_collate
 from data.data_x4k1000 import X4K1000Dataset, x4k_collate
+from data.data_x4k_test import X4K1000TestDataset, x4k_test_collate
 from data.samplers import PureBatchSampler, DistributedPureBatchSampler
+from utils.tiling import infer_with_tiling
 from config.default import TrainingConfig
 from config.manager import RunManager
 from config.dpp import setup_distributed_training, cleanup_distributed_training, is_main_process
@@ -247,7 +249,28 @@ class MixedTrainer:
             pin_memory=True
         )
 
-        print(f"  Validation: {len(vimeo_val):,} Vimeo samples")
+        print(f"  Vimeo Validation: {len(vimeo_val):,} samples")
+
+        # ===== X4K Test Dataset =====
+        x4k_test = X4K1000TestDataset(
+            root=self.x4k_config['root'],
+            step=1,  # Always use STEP=1 for validation (consistent evaluation)
+            n_frames=4,
+        )
+
+        x4k_sampler = DistributedSampler(x4k_test, shuffle=False) if self.is_distributed else None
+
+        self.x4k_test_loader = DataLoader(
+            x4k_test,
+            batch_size=1,  # Process one 4K image at a time (for tiled inference)
+            shuffle=False,
+            num_workers=4,
+            sampler=x4k_sampler,
+            collate_fn=x4k_test_collate,
+            pin_memory=True
+        )
+
+        print(f"  X4K Test: {len(x4k_test):,} samples (N=4, STEP=1)")
 
     def _mixed_collate(self, batch):
         """Auto-detect dataset type and route to correct collate function"""
@@ -260,6 +283,38 @@ class MixedTrainer:
             return x4k_collate(batch)
         else:
             raise ValueError(f"Unexpected N={N} frames in batch")
+
+    def _save_image_grid(self, images: Dict[str, torch.Tensor], path: Path):
+        """
+        Save validation samples as 2x3 grid.
+
+        Grid layout:
+          Row 1: frame0  | frame1  | target
+          Row 2: pred    | error   | conf
+
+        Args:
+            images: Dict with keys ['frame0', 'frame1', 'target', 'pred', 'error', 'conf']
+            path: Save path for PNG file
+        """
+        keys = ['frame0', 'frame1', 'target', 'pred', 'error', 'conf']
+        imgs = []
+
+        for k in keys:
+            if k in images:
+                img = images[k].clamp(0, 1)
+                # Convert to numpy uint8 [H, W, 3]
+                img = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
+                imgs.append(img)
+
+        if imgs:
+            h, w = imgs[0].shape[:2]
+            # Create 2x3 grid
+            grid = np.zeros((h*2, w*3, 3), dtype=np.uint8)
+            for i, img in enumerate(imgs):
+                row, col = i // 3, i % 3
+                grid[row*h:(row+1)*h, col*w:(col+1)*w] = img
+
+            Image.fromarray(grid).save(path)
 
     def _print_model_info(self):
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -367,14 +422,21 @@ class MixedTrainer:
                 if self.is_distributed:
                     dist.barrier()
 
-                val_metrics = self.validate()
+                # Validate on both datasets
+                vimeo_metrics = self.validate_vimeo()
+                x4k_metrics = self.validate_x4k()
 
                 if self.is_main_process and self.run_manager:
-                    self.run_manager.log_metrics(val_metrics, self.global_step, "val")
+                    # Log separately with prefixes
+                    vimeo_prefixed = {f"vimeo/{k}": v for k, v in vimeo_metrics.items()}
+                    x4k_prefixed = {f"x4k/{k}": v for k, v in x4k_metrics.items()}
 
-                    # Update best PSNR
-                    if val_metrics.get('psnr', 0) > self.best_psnr:
-                        self.best_psnr = val_metrics['psnr']
+                    self.run_manager.log_metrics(vimeo_prefixed, self.global_step, "val")
+                    self.run_manager.log_metrics(x4k_prefixed, self.global_step, "val")
+
+                    # Update best PSNR (use Vimeo as primary metric)
+                    if vimeo_metrics.get('psnr', 0) > self.best_psnr:
+                        self.best_psnr = vimeo_metrics['psnr']
 
                 self.model.train()
 
@@ -397,8 +459,8 @@ class MixedTrainer:
         return metric_tracker.get_averages()
 
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
-        """Validate on Vimeo dataset"""
+    def validate_vimeo(self) -> Dict[str, float]:
+        """Validate on Vimeo dataset (N=2, full resolution)"""
         self.model.eval()
         self.ssim_metric.reset()
 
@@ -411,9 +473,15 @@ class MixedTrainer:
         iterable = self.val_loader
         pbar = None
         if self.is_main_process:
-            pbar = tqdm(self.val_loader, desc="Validating", unit="sample",
+            pbar = tqdm(self.val_loader, desc="Validating Vimeo", unit="sample",
                        ncols=120, leave=False, colour="green")
             iterable = pbar
+
+        # Compute sample indices for saving
+        num_val_batches = len(self.val_loader)
+        sample_indices = np.linspace(0, num_val_batches - 1,
+                                    min(self.config.n_val_samples, num_val_batches),
+                                    dtype=int)
 
         for idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             frames = frames.to(self.device, non_blocking=True)
@@ -424,6 +492,7 @@ class MixedTrainer:
             pred, aux = model_to_eval(frames, anchor_times, target_time)
             pred = pred.clamp(0, 1)
 
+            # Metrics
             mse = F.mse_loss(pred, target)
             psnr = -10 * torch.log10(mse + 1e-8)
             total_psnr += psnr.item() * frames.size(0)
@@ -433,6 +502,20 @@ class MixedTrainer:
             batch_ssim = self.ssim_metric(pred, target).item()
             total_ssim_sum += batch_ssim * frames.size(0)
 
+            # Save samples (main process only)
+            if idx in sample_indices and self.is_main_process and self.run_manager:
+                viz_dict = {
+                    'frame0': frames[0, 0],
+                    'frame1': frames[0, -1],
+                    'target': target[0],
+                    'pred': pred[0],
+                    'error': (pred[0] - target[0]).abs().mean(0, True).repeat(3,1,1),
+                    'conf': aux['confidence'][0].repeat(3,1,1) if 'confidence' in aux else torch.zeros_like(pred[0])
+                }
+                save_path = self.run_manager.sample_dir / f"vimeo_epoch_{self.epoch:03d}_sample_{idx:03d}.png"
+                self._save_image_grid(viz_dict, save_path)
+                self.run_manager.log_images(viz_dict, self.global_step, "val/vimeo")
+
             if self.is_main_process and pbar is not None:
                 pbar.set_postfix({
                     'psnr': f"{psnr.item():.2f}",
@@ -440,7 +523,7 @@ class MixedTrainer:
                     'avg_psnr': f"{total_psnr/num_samples:.2f}"
                 })
 
-        # Aggregate
+        # Aggregate across GPUs
         if self.is_distributed:
             local_results = torch.tensor([total_psnr, total_ssim_sum, float(num_samples)],
                                         dtype=torch.float64, device=self.device)
@@ -453,7 +536,113 @@ class MixedTrainer:
         avg_ssim = self.ssim_metric.compute().item()
 
         if self.is_main_process:
-            print(f"\n  📈 Validation: PSNR={avg_psnr:.2f} dB, SSIM={avg_ssim:.4f}")
+            print(f"\n  📈 Vimeo Validation: PSNR={avg_psnr:.2f} dB, SSIM={avg_ssim:.4f}")
+
+        return {'psnr': avg_psnr, 'ssim': avg_ssim}
+
+    @torch.no_grad()
+    def validate_x4k(self) -> Dict[str, float]:
+        """
+        Validate on X4K test dataset (N=4, 4K resolution with tiling).
+
+        Process:
+        1. Tile-based inference: 512×512 tiles with 64px overlap
+        2. Stitch tiles back to full 4K resolution with weighted blending
+        3. Compute PSNR/SSIM on FULL STITCHED 4K image (not crops)
+        4. Save 512×512 center crops as preview samples (visualization only)
+        """
+        self.model.eval()
+        self.ssim_metric.reset()
+
+        total_psnr = 0.0
+        total_ssim_sum = 0.0
+        num_samples = 0
+
+        model_to_eval = self.model.module if self.is_distributed else self.model
+
+        iterable = self.x4k_test_loader
+        pbar = None
+        if self.is_main_process:
+            pbar = tqdm(self.x4k_test_loader, desc="Validating X4K", unit="sample",
+                       ncols=120, leave=False, colour="blue")
+            iterable = pbar
+
+        # Compute sample indices for saving
+        num_val_batches = len(self.x4k_test_loader)
+        sample_indices = np.linspace(0, num_val_batches - 1,
+                                    min(self.config.n_val_samples, num_val_batches),
+                                    dtype=int)
+
+        for idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
+            frames = frames.to(self.device, non_blocking=True)
+            anchor_times = anchor_times.to(self.device, non_blocking=True)
+            target_time = target_time.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+
+            # ===== STEP 1: Tiled inference + stitching =====
+            # Processes 4K image in 512×512 tiles, stitches back to full resolution
+            pred_full = infer_with_tiling(
+                model_to_eval, frames, anchor_times, target_time,
+                tile_size=512, overlap=64
+            )
+            pred_full = pred_full.clamp(0, 1)
+
+            # ===== STEP 2: Compute metrics on FULL STITCHED 4K image =====
+            mse = F.mse_loss(pred_full, target)
+            psnr = -10 * torch.log10(mse + 1e-8)
+            total_psnr += psnr.item()
+            num_samples += 1
+
+            # SSIM also computed on full 4K resolution
+            self.ssim_metric.update(pred_full, target)
+            batch_ssim = self.ssim_metric(pred_full, target).item()
+            total_ssim_sum += batch_ssim
+
+            # ===== STEP 3: Save center crop samples (512×512) for visualization =====
+            # Note: Metrics are computed on FULL 4K, but we save crops for easier inspection
+            if idx in sample_indices and self.is_main_process and self.run_manager:
+                _, _, H, W = pred_full.shape
+                crop_size = 512
+
+                # Center crop all frames for visualization
+                cy, cx = H // 2, W // 2
+                y1, y2 = cy - crop_size // 2, cy + crop_size // 2
+                x1, x2 = cx - crop_size // 2, cx + crop_size // 2
+
+                viz_dict = {
+                    'frame0': frames[0, 0, :, y1:y2, x1:x2],
+                    'frame1': frames[0, -1, :, y1:y2, x1:x2],
+                    'target': target[0, :, y1:y2, x1:x2],
+                    'pred': pred_full[0, :, y1:y2, x1:x2],
+                    'error': (pred_full[0, :, y1:y2, x1:x2] - target[0, :, y1:y2, x1:x2]).abs().mean(0, True).repeat(3,1,1),
+                    'conf': torch.zeros(3, crop_size, crop_size, device=self.device)  # Placeholder
+                }
+
+                save_path = self.run_manager.sample_dir / f"x4k_epoch_{self.epoch:03d}_sample_{idx:03d}.png"
+                self._save_image_grid(viz_dict, save_path)
+                self.run_manager.log_images(viz_dict, self.global_step, "val/x4k")
+
+            if self.is_main_process and pbar is not None:
+                pbar.set_postfix({
+                    'psnr': f"{psnr.item():.2f}",
+                    'ssim': f"{batch_ssim:.4f}",
+                    'avg_psnr': f"{total_psnr/num_samples:.2f}"
+                })
+
+        # Aggregate across GPUs
+        if self.is_distributed:
+            local_results = torch.tensor([total_psnr, total_ssim_sum, float(num_samples)],
+                                        dtype=torch.float64, device=self.device)
+            dist.all_reduce(local_results, op=dist.ReduceOp.SUM)
+            total_psnr = local_results[0].item()
+            total_ssim_sum = local_results[1].item()
+            num_samples = int(local_results[2].item())
+
+        avg_psnr = total_psnr / max(1, num_samples)
+        avg_ssim = self.ssim_metric.compute().item()
+
+        if self.is_main_process:
+            print(f"\n  📈 X4K Validation: PSNR={avg_psnr:.2f} dB, SSIM={avg_ssim:.4f}")
 
         return {'psnr': avg_psnr, 'ssim': avg_ssim}
 
@@ -497,21 +686,31 @@ class MixedTrainer:
                 if self.is_distributed:
                     dist.barrier()
 
-                val_metrics = self.validate()
+                # Validate on both datasets
+                vimeo_metrics = self.validate_vimeo()
+                x4k_metrics = self.validate_x4k()
 
                 if self.is_distributed:
                     dist.barrier()
 
                 if self.is_main_process:
-                    is_best = val_metrics['psnr'] > self.best_psnr
+                    # Determine if best (use Vimeo PSNR as primary)
+                    is_best = vimeo_metrics['psnr'] > self.best_psnr
                     if is_best:
-                        self.best_psnr = val_metrics['psnr']
+                        self.best_psnr = vimeo_metrics['psnr']
+
+                    # Log to WandB/TensorBoard
+                    if self.run_manager:
+                        vimeo_prefixed = {f"vimeo/{k}": v for k, v in vimeo_metrics.items()}
+                        x4k_prefixed = {f"x4k/{k}": v for k, v in x4k_metrics.items()}
+                        self.run_manager.log_metrics(vimeo_prefixed, self.global_step, "val")
+                        self.run_manager.log_metrics(x4k_prefixed, self.global_step, "val")
 
                     print(f"\n📊 Epoch {epoch+1} Summary:")
                     print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
-                    print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-                    print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-                    print(f"  Best PSNR: {self.best_psnr:.2f} dB")
+                    print(f"  Vimeo PSNR: {vimeo_metrics['psnr']:.2f} dB, SSIM: {vimeo_metrics['ssim']:.4f}")
+                    print(f"  X4K PSNR:   {x4k_metrics['psnr']:.2f} dB, SSIM: {x4k_metrics['ssim']:.4f}")
+                    print(f"  Best PSNR (Vimeo): {self.best_psnr:.2f} dB")
 
                     if self.run_manager:
                         self.run_manager.save_checkpoint(
