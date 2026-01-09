@@ -334,9 +334,12 @@ class MixedTrainer:
         print(f"    Fusion (CrossAttention): {fus_params/1e6:.2f}M")
         print(f"    Decoder (NAFNet):        {dec_params/1e6:.2f}M")
 
-    def train_epoch(self) -> Dict[str, float]:
+    def train_epoch(self) -> Dict[str, Dict[str, float]]:
         self.model.train()
-        metric_tracker = MetricTracker()
+
+        # Separate trackers for each dataset
+        vimeo_tracker = MetricTracker()
+        x4k_tracker = MetricTracker()
 
         if self.is_distributed:
             dist.barrier()
@@ -394,12 +397,16 @@ class MixedTrainer:
             if self.lr_scheduler and self.global_step >= self.config.warmup_steps:
                 self.lr_scheduler.step()
 
-            metric_tracker.update(metrics)
-            metrics['lr'] = self.optimizer.param_groups[0]['lr']
-
-            # Detect batch type for logging
+            # Detect batch type and update corresponding tracker
             N = frames.shape[1]
             batch_type = "vimeo" if N == 2 else "x4k"
+
+            if batch_type == "vimeo":
+                vimeo_tracker.update(metrics)
+            else:
+                x4k_tracker.update(metrics)
+
+            metrics['lr'] = self.optimizer.param_groups[0]['lr']
 
             if self.is_main_process and pbar is not None:
                 pbar.set_postfix({
@@ -410,12 +417,23 @@ class MixedTrainer:
                     'lr': f"{metrics['lr']:.1e}"
                 })
 
-            # Logging
+            # Logging - separate metrics for each dataset
             if self.global_step % self.config.log_interval == 0 and self.is_main_process:
-                avg_metrics = metric_tracker.get_averages()
                 if self.run_manager:
-                    self.run_manager.log_metrics(avg_metrics, self.global_step, "train")
-                metric_tracker.reset()
+                    # Log Vimeo metrics
+                    vimeo_avg = vimeo_tracker.get_averages()
+                    if vimeo_avg:  # Only log if we have Vimeo samples
+                        vimeo_prefixed = {f"vimeo/{k}": v for k, v in vimeo_avg.items()}
+                        self.run_manager.log_metrics(vimeo_prefixed, self.global_step, "train")
+
+                    # Log X4K metrics
+                    x4k_avg = x4k_tracker.get_averages()
+                    if x4k_avg:  # Only log if we have X4K samples
+                        x4k_prefixed = {f"x4k/{k}": v for k, v in x4k_avg.items()}
+                        self.run_manager.log_metrics(x4k_prefixed, self.global_step, "train")
+
+                vimeo_tracker.reset()
+                x4k_tracker.reset()
 
             # Validation
             if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
@@ -456,7 +474,11 @@ class MixedTrainer:
 
             self.global_step += 1
 
-        return metric_tracker.get_averages()
+        # Return separate metrics for each dataset
+        return {
+            'vimeo': vimeo_tracker.get_averages(),
+            'x4k': x4k_tracker.get_averages(),
+        }
 
     @torch.no_grad()
     def validate_vimeo(self) -> Dict[str, float]:
@@ -707,10 +729,11 @@ class MixedTrainer:
                         self.run_manager.log_metrics(x4k_prefixed, self.global_step, "val")
 
                     print(f"\n📊 Epoch {epoch+1} Summary:")
-                    print(f"  Train Loss: {epoch_metrics.get('total', 0):.4f}")
-                    print(f"  Vimeo PSNR: {vimeo_metrics['psnr']:.2f} dB, SSIM: {vimeo_metrics['ssim']:.4f}")
-                    print(f"  X4K PSNR:   {x4k_metrics['psnr']:.2f} dB, SSIM: {x4k_metrics['ssim']:.4f}")
-                    print(f"  Best PSNR (Vimeo): {self.best_psnr:.2f} dB")
+                    print(f"  Train Loss (Vimeo): {epoch_metrics['vimeo'].get('total', 0):.4f}")
+                    print(f"  Train Loss (X4K):   {epoch_metrics['x4k'].get('total', 0):.4f}")
+                    print(f"  Val PSNR (Vimeo):   {vimeo_metrics['psnr']:.2f} dB, SSIM: {vimeo_metrics['ssim']:.4f}")
+                    print(f"  Val PSNR (X4K):     {x4k_metrics['psnr']:.2f} dB, SSIM: {x4k_metrics['ssim']:.4f}")
+                    print(f"  Best PSNR (Vimeo):  {self.best_psnr:.2f} dB")
 
                     if self.run_manager:
                         self.run_manager.save_checkpoint(
