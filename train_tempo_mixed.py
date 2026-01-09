@@ -183,7 +183,7 @@ class MixedTrainer:
         x4k_train = X4K1000Dataset(
             root=self.x4k_config['root'],
             split="train",
-            step=self.x4k_config['step'],
+            steps=self.x4k_config['steps'],  # Can be single int or list
             crop_size=self.x4k_config['crop_size'],
             aug_flip=True,
             n_frames=4,
@@ -197,7 +197,7 @@ class MixedTrainer:
         x4k_ratio = 1.0 - vimeo_ratio
 
         print(f"  Vimeo: {len(vimeo_train):,} samples (N=2)")
-        print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEP={self.x4k_config['step']})")
+        print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']})")
         print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {x4k_ratio:.0%} X4K")
 
         # ===== Pure Batch Sampler =====
@@ -768,8 +768,9 @@ def main():
     # X4K dataset settings (not part of TrainingConfig, so provide defaults here)
     parser.add_argument("--x4k_root", type=str, default="/Users/nightstalker/Projects/datasets",
                        help="Path to X4K1000 dataset")
-    parser.add_argument("--x4k_step", type=int, default=1,
-                       help="STEP parameter for X4K (1=small motion, 2=medium, 3=large)")
+    parser.add_argument("--x4k_step", type=int, nargs='+', default=[1],
+                       help="STEP parameter(s) for X4K. Can be single (e.g., 3) or multiple (e.g., 1 3). "
+                            "1=small motion, 2=medium, 3=large. Multiple steps increase motion diversity.")
     parser.add_argument("--x4k_crop", type=int, default=512,
                        help="Crop size for X4K (512 or 768)")
     parser.add_argument("--vimeo_ratio", type=float, default=0.5,
@@ -832,7 +833,7 @@ def main():
     # Build X4K config dict
     x4k_config = {
         'root': args.x4k_root,
-        'step': args.x4k_step,
+        'steps': args.x4k_step,
         'crop_size': args.x4k_crop,
         'vimeo_ratio': args.vimeo_ratio,
     }

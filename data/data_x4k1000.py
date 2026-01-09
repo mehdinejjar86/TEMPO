@@ -9,11 +9,15 @@ STEP-based sampling allows systematic control of motion magnitude:
 Each 65-frame sequence generates multiple training samples (all frames between
 anchors become targets). Number of targets depends on both STEP and n_frames.
 Example with default n_frames=4: step=1→3 targets, step=2→9 targets, step=3→15 targets.
+
+Multi-step training:
+  - Pass steps=[1, 3] to train on both small and large motion
+  - Increases motion diversity for better generalization
 """
 
 import random
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
 import numpy as np
 import torch
@@ -41,7 +45,9 @@ class X4K1000Dataset(data.Dataset):
     Args:
         root: Dataset root (default: /Users/nightstalker/Projects/datasets)
         split: 'train' or 'test'
-        step: Frame spacing parameter (1, 2, 3, ...)
+        steps: Frame spacing parameter(s). Can be:
+            - Single int: steps=3 (only large motion)
+            - List of ints: steps=[1, 3] (small + large motion)
         crop_size: Spatial crop for 4K (512 or 768), None for no crop
         aug_flip: Horizontal flip augmentation
         n_frames: Number of anchor frames (default: 4)
@@ -51,25 +57,28 @@ class X4K1000Dataset(data.Dataset):
         self,
         root: str = "/Users/nightstalker/Projects/datasets",
         split: str = "train",
-        step: int = 1,
+        steps: Union[int, List[int]] = 1,
         crop_size: Optional[int] = None,
         aug_flip: bool = False,
         n_frames: int = 4,
     ):
         self.root = Path(root)
         self.split = split
-        self.step = step
+
+        # Convert single int to list for uniform handling
+        self.steps = [steps] if isinstance(steps, int) else steps
+
         self.crop_size = crop_size
         self.aug_flip = aug_flip
         self.n_frames = n_frames
 
         # Scan all sequences
         self.sequences = self._scan_sequences()
-        print(f"Found {len(self.sequences)} sequences in {split} split")
+        print(f"[X4K {split}] Found {len(self.sequences)} sequences")
 
         # Generate (sequence_idx, target_idx) pairs for all valid samples
         self.samples = self._generate_samples()
-        print(f"Generated {len(self.samples)} samples with step={step}")
+        print(f"[X4K {split}] Generated {len(self.samples)} samples with steps={self.steps}")
 
     def _scan_sequences(self) -> List[str]:
         """Scan nested directory structure for 65-frame sequences"""
@@ -97,36 +106,46 @@ class X4K1000Dataset(data.Dataset):
 
     def _generate_samples(self) -> List[Tuple[int, int, List[int]]]:
         """
-        Generate all (sequence, target) pairs for the given STEP.
+        Generate all (sequence, target) pairs for all specified STEPs.
 
-        Each sequence can generate multiple training samples.
+        Each sequence can generate multiple training samples per STEP.
+        With multiple steps, samples from all steps are combined.
+
+        Example with steps=[1, 3]:
+          - STEP=1: 3 targets per sequence
+          - STEP=3: 15 targets per sequence
+          - Total: 18 samples per sequence
 
         Returns:
             List of (seq_idx, target_frame, anchors) tuples
         """
-        spacing = 2 * self.step  # step=1→2, step=2→4, step=3→6
-        anchors = [i * spacing for i in range(self.n_frames)]  # [0, spacing, 2*spacing, 3*spacing]
+        all_samples = []
 
-        # Check if anchors fit in 65 frames (indices 0-64)
-        if anchors[-1] >= 65:
-            raise ValueError(
-                f"step={self.step} (spacing={spacing}) produces anchors={anchors}, "
-                f"but sequence only has 65 frames (indices 0-64). Max step is {64 // (2*(self.n_frames-1))}"
-            )
+        for step in self.steps:
+            spacing = 2 * step  # step=1→2, step=2→4, step=3→6
+            anchors = [i * spacing for i in range(self.n_frames)]  # [0, spacing, 2*spacing, 3*spacing]
 
-        # All target frames between first and last anchor (excluding anchors)
-        valid_targets = []
-        for i in range(anchors[0] + 1, anchors[-1]):
-            if i not in anchors:
-                valid_targets.append(i)
+            # Check if anchors fit in 65 frames (indices 0-64)
+            if anchors[-1] >= 65:
+                raise ValueError(
+                    f"step={step} (spacing={spacing}) produces anchors={anchors}, "
+                    f"but sequence only has 65 frames (indices 0-64). Max step is {64 // (2*(self.n_frames-1))}"
+                )
 
-        # Generate all (seq_idx, target_frame) pairs
-        samples = []
-        for seq_idx in range(len(self.sequences)):
-            for target_frame in valid_targets:
-                samples.append((seq_idx, target_frame, anchors))
+            # All target frames between first and last anchor (excluding anchors)
+            valid_targets = []
+            for i in range(anchors[0] + 1, anchors[-1]):
+                if i not in anchors:
+                    valid_targets.append(i)
 
-        return samples  # [(seq_idx, target_frame, [anchor frames]), ...]
+            # Generate all (seq_idx, target_frame, anchors) pairs for this step
+            for seq_idx in range(len(self.sequences)):
+                for target_frame in valid_targets:
+                    all_samples.append((seq_idx, target_frame, anchors))
+
+            print(f"  STEP={step}: {len(valid_targets)} targets/seq × {len(self.sequences)} seqs = {len(valid_targets) * len(self.sequences)} samples")
+
+        return all_samples  # [(seq_idx, target_frame, [anchor frames]), ...]
 
     def _load_frames(self, seq_path: str, frame_indices: List[int]) -> List[torch.Tensor]:
         """Load frames at specified indices"""
