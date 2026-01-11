@@ -151,15 +151,18 @@ def infer_with_tiling(
     anchor_times: torch.Tensor,
     target_time: torch.Tensor,
     tile_size: int = 512,
-    overlap: int = 64
+    overlap: int = 64,
+    pad_size: int = None
 ) -> torch.Tensor:
     """
-    Tile-based inference for high-resolution images.
+    Tile-based inference for high-resolution images with edge padding.
 
     Processes large images by:
-    1. Dividing into overlapping tiles
-    2. Running model on each tile independently
-    3. Stitching results with weighted blending
+    1. Pad image edges with reflection padding (eliminates edge artifacts)
+    2. Divide into overlapping tiles
+    3. Run model on each tile independently
+    4. Stitch results with weighted blending
+    5. Crop back to original size
 
     Args:
         model: TEMPO model (or any model with forward(frames, anchor_times, target_time))
@@ -168,6 +171,8 @@ def infer_with_tiling(
         target_time: [1] target timestamp
         tile_size: Size of square tiles (default: 512)
         overlap: Overlap between tiles (default: 64)
+        pad_size: Padding to add before tiling (default: overlap)
+                 Eliminates edge artifacts by ensuring all pixels have tile coverage
 
     Returns:
         pred: [1, 3, H, W] stitched prediction at full resolution
@@ -181,17 +186,32 @@ def infer_with_tiling(
         - ~2-3x slower than direct inference (tile overhead)
         - Necessary trade-off for memory constraints
     """
-    B, N, C, H, W = frames.shape
+    B, N, C, H_orig, W_orig = frames.shape
     assert B == 1, "Tiled inference only supports batch_size=1 (single image at a time)"
 
-    # Compute tile coordinates
-    tiles = compute_tiles(H, W, tile_size, overlap)
+    # Default padding is the overlap size
+    if pad_size is None:
+        pad_size = overlap
+
+    # Pad input frames with reflection padding to avoid edge artifacts
+    # pad: (left, right, top, bottom)
+    frames_padded = torch.nn.functional.pad(
+        frames,
+        (pad_size, pad_size, pad_size, pad_size),
+        mode='reflect'
+    )
+
+    # Get padded dimensions
+    _, _, _, H_pad, W_pad = frames_padded.shape
+
+    # Compute tile coordinates on padded image
+    tiles = compute_tiles(H_pad, W_pad, tile_size, overlap)
 
     # Process each tile
     tile_preds = []
     for y1, y2, x1, x2 in tiles:
         # Extract tile from all N anchor frames
-        frames_tile = frames[:, :, :, y1:y2, x1:x2]
+        frames_tile = frames_padded[:, :, :, y1:y2, x1:x2]
 
         # Run model on tile
         pred_tile, _ = model(frames_tile, anchor_times, target_time)
@@ -199,8 +219,11 @@ def infer_with_tiling(
         # Store prediction (remove batch dimension)
         tile_preds.append(pred_tile[0])  # [3, tile_size, tile_size]
 
-    # Stitch tiles back to full resolution
-    pred_full = stitch_tiles(tile_preds, tiles, H, W, overlap)
+    # Stitch tiles back to full resolution (padded size)
+    pred_padded = stitch_tiles(tile_preds, tiles, H_pad, W_pad, overlap)
+
+    # Crop back to original size
+    pred_full = pred_padded[:, pad_size:pad_size+H_orig, pad_size:pad_size+W_orig]
 
     # Return with batch dimension
     return pred_full.unsqueeze(0)  # [1, 3, H, W]
