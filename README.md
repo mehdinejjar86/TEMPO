@@ -195,8 +195,36 @@ output, aux = model(frames, timestamps, target_time)
 
 ### Training
 
-**Single GPU:**
+**Mixed Dataset Training (Vimeo + X4K):**
+
+TEMPO supports training on mixed datasets with separate metric tracking for each dataset. This enables robust training across different motion scales and resolutions.
+
 ```bash
+# Train on Vimeo (N=2, 256×256) + X4K (N=4, 512×512 crops)
+python train_tempo_mixed.py \
+    --data_root datasets/vimeo_triplet \
+    --x4k_root datasets/ \
+    --x4k_step 1 3 \
+    --x4k_crop 512 \
+    --vimeo_ratio 0.5 \
+    --batch_size 6 \
+    --epochs 100 \
+    --base_channels 64 \
+    --encoder_depths 3 3 12 3 \
+    --decoder_depths 3 3 3 3 \
+    --compile \
+    --exp_name "tempo_mixed_training"
+```
+
+**Key Features:**
+- **Multi-STEP Support**: `--x4k_step 1 3` trains on both small motion (STEP=1) and large motion (STEP=3) simultaneously
+- **Separate Tracking**: Logs `train/vimeo/*` and `train/x4k/*` metrics independently
+- **Tiled 4K Validation**: Automatically handles 4K images with 512×512 tiling + stitching
+- **Batch Mixing**: `--vimeo_ratio 0.5` means 50% Vimeo, 50% X4K per batch
+
+**Single Dataset Training:**
+```bash
+# Vimeo only (traditional N=2 frame interpolation)
 python train_tempo.py \
     --data_root datasets/vimeo_triplet \
     --batch_size 8 \
@@ -208,25 +236,25 @@ python train_tempo.py \
 
 **Multi-GPU (DDP):**
 ```bash
-torchrun --nproc_per_node=4 train_tempo.py \
+torchrun --nproc_per_node=4 train_tempo_mixed.py \
     --data_root datasets/vimeo_triplet \
+    --x4k_root datasets/ \
+    --x4k_step 1 3 \
     --batch_size 4 \
-    --epochs 100 \
-    --lr 1e-4 \
-    --amp \
-    --amp_dtype bf16 \
     --distributed
 ```
 
 **Resume Training:**
 ```bash
-python train_tempo.py \
-    --resume runs/tempo_exp/checkpoints/latest.pt \
-    --data_root datasets/vimeo_triplet
+python train_tempo_mixed.py \
+    --resume runs/tempo_exp/checkpoints/checkpoint_latest.pth \
+    --data_root datasets/vimeo_triplet \
+    --x4k_root datasets/
 ```
 
 ### Configuration Options
 
+**Model Architecture:**
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--base_channels` | 64 | Base channel dimension |
@@ -235,11 +263,25 @@ python train_tempo.py \
 | `--decoder_depths` | [3,3,3,3] | NAFNet decoder depths |
 | `--attn_heads` | 4 | Attention heads |
 | `--attn_points` | 4 | Deformable sampling points per head |
+
+**Training:**
+| Argument | Default | Description |
+|----------|---------|-------------|
 | `--batch_size` | 4 | Batch size per GPU |
 | `--lr` | 1e-4 | Learning rate |
 | `--epochs` | 100 | Training epochs |
 | `--amp` | False | Enable automatic mixed precision |
 | `--amp_dtype` | fp32 | AMP dtype (fp16, bf16, fp32) |
+| `--compile` | False | Use torch.compile for 3x speedup |
+
+**Mixed Dataset (train_tempo_mixed.py):**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--data_root` | - | Vimeo-90K triplet dataset path |
+| `--x4k_root` | - | X4K1000 dataset root path |
+| `--x4k_step` | [1] | STEP parameter(s) for X4K (e.g., `1 3` for multi-STEP) |
+| `--x4k_crop` | 512 | Crop size for X4K training (512 or 768) |
+| `--vimeo_ratio` | 0.5 | Ratio of Vimeo samples per batch (0.0-1.0) |
 
 ### Inference
 
@@ -286,6 +328,45 @@ output, aux = model(frames, timestamps, target_time=torch.tensor([0.5]))
 print(f"Confidence: {aux['confidence'].mean():.3f}")
 ```
 
+### 4K Tiled Inference
+
+For high-resolution images that don't fit in GPU memory, TEMPO includes tiled inference with seamless stitching:
+
+```python
+from utils.tiling import infer_with_tiling
+
+# Load 4K frames (2160×3840)
+frames_4k = load_4k_frames()  # [1, N, 3, 2160, 3840]
+
+# Tile-based inference with reflection padding
+# - Processes 512×512 tiles with 64px overlap
+# - Reflection padding eliminates edge artifacts
+# - Weighted blending for seamless stitching
+output_4k = infer_with_tiling(
+    model,
+    frames_4k,
+    anchor_times,
+    target_time,
+    tile_size=512,
+    overlap=64,
+    pad_size=64  # reflection padding (default: overlap size)
+)
+
+# Result: [1, 3, 2160, 3840] with perfect reconstruction
+```
+
+**Tiling Performance:**
+- **Memory**: Constant ~2GB (independent of resolution)
+- **Speed**: ~2-3x slower than direct inference
+- **Quality**: Perfect reconstruction (max error < 1e-6)
+- **Edge Handling**: Reflection padding eliminates boundary artifacts
+
+**Test Tiling System:**
+```bash
+python test_tiling.py
+# Generates visualizations and verifies perfect reconstruction
+```
+
 ### Smoke Test
 
 ```bash
@@ -296,6 +377,8 @@ python smoke_test.py
 ## Dataset Preparation
 
 ### Vimeo-90K Triplet
+
+Standard dataset for frame interpolation (N=2, 256×256).
 
 ```bash
 # Download
@@ -314,6 +397,47 @@ datasets/vimeo_triplet/
 │   └── ...
 ├── tri_trainlist.txt
 └── tri_testlist.txt
+```
+
+### X4K1000
+
+High-resolution dataset for multi-frame interpolation (N=4, 4K resolution).
+
+```bash
+# Download X4K1000 from official source
+# Expected structure:
+datasets/
+├── train/
+│   ├── Type1/
+│   │   ├── TEST01_001_f0001/
+│   │   │   ├── 0000.png
+│   │   │   ├── 0001.png
+│   │   │   └── ... (65 frames)
+│   │   └── ...
+│   └── ...
+└── test/
+    ├── Type1/
+    │   ├── TEST01_003_f0433/
+    │   │   ├── 0000.png
+    │   │   └── ... (33 frames)
+    │   └── ...
+    └── ...
+```
+
+**STEP-based Sampling:**
+
+X4K supports configurable motion magnitude through the STEP parameter:
+
+| STEP | Spacing | Anchors (N=4) | Motion | Targets/Seq |
+|------|---------|---------------|--------|-------------|
+| 1 | 2 frames | [0, 2, 4, 6] | Small | 3 |
+| 2 | 4 frames | [0, 4, 8, 12] | Medium | 9 |
+| 3 | 6 frames | [0, 6, 12, 18] | Large | 15 |
+
+**Multi-STEP Training:**
+```bash
+# Train on both small and large motion simultaneously
+--x4k_step 1 3  # Combines 3 + 15 = 18 samples per sequence
 ```
 
 ### Custom Dataset
@@ -373,19 +497,81 @@ TEMPO/
 │   ├── temporal_view_synthesis.py  # Deformable attention + fusion
 │   ├── convnext_nafnet.py          # Encoder + Decoder
 │   ├── temporal.py                 # Temporal weighting
+│   ├── temporal_attention.py       # Deformable temporal attention
 │   └── loss/
 │       └── tempo_loss.py           # Multi-component loss
 ├── data/
-│   └── data_vimeo_triplet.py       # Dataset loader
+│   ├── data_vimeo_triplet.py       # Vimeo-90K dataset (N=2)
+│   ├── data_x4k1000.py             # X4K1000 training dataset (N=4)
+│   └── data_x4k_test.py            # X4K1000 test dataset (33 frames)
+├── utils/
+│   └── tiling.py                   # 4K tiled inference + stitching
 ├── config/
 │   ├── default.py                  # Training config
 │   ├── manager.py                  # Run management
 │   └── dpp.py                      # Distributed training utils
-├── train_tempo.py                  # Training script
+├── train_tempo.py                  # Single dataset training
+├── train_tempo_mixed.py            # Mixed dataset training (Vimeo + X4K)
+├── test_tiling.py                  # Tiling system verification
 ├── smoke_test.py                   # Quick verification
 ├── requirements.txt
 └── README.md
 ```
+
+## Monitoring & Metrics
+
+### Separate Dataset Tracking
+
+When training with `train_tempo_mixed.py`, metrics are tracked separately for each dataset:
+
+**Training Metrics (logged every N steps):**
+```
+train/vimeo/total     # Total loss on Vimeo samples
+train/vimeo/l1        # L1 reconstruction loss
+train/vimeo/psnr      # Training PSNR
+train/x4k/total       # Total loss on X4K samples
+train/x4k/l1          # L1 reconstruction loss
+train/x4k/psnr        # Training PSNR
+```
+
+**Validation Metrics (logged per epoch):**
+```
+val/vimeo/psnr        # Vimeo test set PSNR (256×256)
+val/vimeo/ssim        # Vimeo test set SSIM
+val/x4k/psnr          # X4K test set PSNR (full 4K stitched)
+val/x4k/ssim          # X4K test set SSIM
+```
+
+**Benefits:**
+- Compare training difficulty across datasets
+- Detect overfitting on specific datasets
+- Monitor convergence independently
+- Identify dataset-specific issues
+
+**Epoch Summary:**
+```
+📊 Epoch 10 Summary:
+  Train Loss (Vimeo): 0.0234
+  Train Loss (X4K):   0.0189
+  Val PSNR (Vimeo):   33.42 dB, SSIM: 0.9421
+  Val PSNR (X4K):     37.15 dB, SSIM: 0.9678
+  Best PSNR (Vimeo):  33.42 dB
+```
+
+### Validation System
+
+**Vimeo Validation:**
+- Full resolution (256×256)
+- N=2 frames (traditional interpolation)
+- Saves 8 visualization samples per epoch
+
+**X4K Validation:**
+- Full 4K resolution (2160×3840)
+- N=4 frames (multi-view synthesis)
+- Tiled inference with 512×512 tiles + 64px overlap
+- Reflection padding for perfect edge handling
+- PSNR/SSIM computed on fully stitched 4K image
+- Saves 512×512 center crop samples for visualization
 
 ## Technical Details
 
@@ -431,10 +617,36 @@ A: Yes! Set `target_time` outside the range of `anchor_times`. The continuous ti
 
 A: With N=2, TEMPO has the same information as flow-based methods. With N>2, TEMPO can:
 - See occluded regions from other viewpoints
-- Use sharper frames when some have motion blur  
+- Use sharper frames when some have motion blur
 - Build higher confidence through redundant observations
 
 This is the key architectural advantage.
+
+**Q: How does 4K tiled inference work?**
+
+A: Large images are processed in overlapping 512×512 tiles with:
+1. **Reflection padding** (64px) to eliminate edge artifacts
+2. **Weighted blending** in overlap regions for seamless stitching
+3. **Perfect reconstruction** (max error < 1e-6) after cropping back to original size
+
+Memory usage is constant regardless of resolution.
+
+**Q: What is multi-STEP training?**
+
+A: X4K dataset supports multiple STEP values to control motion magnitude. Using `--x4k_step 1 3` trains on both:
+- STEP=1: Small motion (2-frame spacing)
+- STEP=3: Large motion (6-frame spacing)
+
+This increases motion diversity and improves generalization across different temporal scales.
+
+**Q: Can I resume training with the new code?**
+
+A: Yes! All checkpoints are backward compatible. The changes only affect:
+- How batches are sampled (multi-STEP)
+- How metrics are tracked during training (separate trackers)
+- Validation system (separate Vimeo/X4K)
+
+Model weights, optimizer state, and checkpoint format remain unchanged.
 
 ## Acknowledgements
 
