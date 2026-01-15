@@ -193,12 +193,29 @@ class MixedTrainer:
         train_dataset = ConcatDataset([vimeo_train, x4k_train])
 
         dataset_sizes = [len(vimeo_train), len(x4k_train)]
-        vimeo_ratio = self.x4k_config['vimeo_ratio']
-        x4k_ratio = 1.0 - vimeo_ratio
 
-        print(f"  Vimeo: {len(vimeo_train):,} samples (N=2)")
-        print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']})")
-        print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {x4k_ratio:.0%} X4K")
+        # Calculate optimal ratio for full dataset coverage if requested
+        requested_ratio = self.x4k_config['vimeo_ratio']
+        if requested_ratio < 0:  # Use -1 to trigger auto calculation
+            # Calculate batch counts
+            vimeo_batches = len(vimeo_train) // self.config.batch_size
+            x4k_batches = len(x4k_train) // self.config.batch_size
+            total_batches = vimeo_batches + x4k_batches
+
+            # Set ratio proportional to dataset sizes
+            vimeo_ratio = vimeo_batches / total_batches
+            x4k_ratio = x4k_batches / total_batches
+
+            print(f"  Vimeo: {len(vimeo_train):,} samples (N=2) → {vimeo_batches:,} batches")
+            print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']}) → {x4k_batches:,} batches")
+            print(f"  Auto ratio: {vimeo_ratio:.3f} Vimeo / {x4k_ratio:.3f} X4K (uses ALL samples per epoch)")
+        else:
+            vimeo_ratio = requested_ratio
+            x4k_ratio = 1.0 - vimeo_ratio
+
+            print(f"  Vimeo: {len(vimeo_train):,} samples (N=2)")
+            print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']})")
+            print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {x4k_ratio:.0%} X4K (may skip samples)")
 
         # ===== Pure Batch Sampler =====
         if self.is_distributed:
@@ -797,7 +814,8 @@ def main():
     parser.add_argument("--x4k_crop", type=int, default=512,
                        help="Crop size for X4K (512 or 768)")
     parser.add_argument("--vimeo_ratio", type=float, default=0.5,
-                       help="Fraction of batches from Vimeo (0.0-1.0)")
+                       help="Fraction of batches from Vimeo (0.0-1.0). "
+                            "Use -1 for automatic calculation to see ALL samples from both datasets per epoch.")
 
     # Model architecture
     parser.add_argument("--base_channels", type=int)
@@ -816,6 +834,12 @@ def main():
                        help="Use PyTorch 2.0 compile")
     parser.add_argument("--amp", action="store_true", dest='use_amp')
     parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"])
+
+    # Loss configuration
+    parser.add_argument("--loss_preset", type=str, choices=["psnr", "balanced", "ssim"],
+                       default="psnr",
+                       help="Loss configuration preset: 'psnr' (default, max PSNR), "
+                            "'balanced' (balance PSNR+SSIM), 'ssim' (prioritize SSIM)")
 
     # Logging
     parser.add_argument("--use_wandb", action="store_true")
@@ -852,6 +876,19 @@ def main():
 
     # Apply overrides to default config
     config = replace(default_config, **overrides)
+
+    # Apply loss configuration preset
+    if args.loss_preset == "balanced":
+        from config.loss_balanced import BALANCED_LOSS_CONFIG
+        config = replace(config, loss_config=BALANCED_LOSS_CONFIG)
+        print(f"🎯 Using BALANCED loss configuration (optimizes both PSNR and SSIM)")
+    elif args.loss_preset == "ssim":
+        from config.loss_balanced import SSIM_FOCUSED_CONFIG
+        config = replace(config, loss_config=SSIM_FOCUSED_CONFIG)
+        print(f"🎯 Using SSIM-FOCUSED loss configuration (prioritizes SSIM)")
+    else:
+        # Default PSNR-optimized (no config override needed)
+        print(f"🎯 Using PSNR-OPTIMIZED loss configuration (default)")
 
     # Build X4K config dict
     x4k_config = {
