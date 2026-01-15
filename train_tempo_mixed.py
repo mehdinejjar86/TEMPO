@@ -851,7 +851,7 @@ def main():
 
     # Separate X4K-specific args (not part of TrainingConfig)
     x4k_args = {
-        'x4k_root', 'x4k_step', 'x4k_crop', 'vimeo_ratio'
+        'x4k_root', 'x4k_step', 'x4k_crop', 'vimeo_ratio', 'loss_preset'
     }
 
     # Build override dict from explicitly provided TrainingConfig args
