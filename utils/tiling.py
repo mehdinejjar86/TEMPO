@@ -194,15 +194,20 @@ def infer_with_tiling(
         pad_size = overlap
 
     # Pad input frames with reflection padding to avoid edge artifacts
+    # PyTorch's reflection padding only supports up to 4D tensors
+    # Reshape [B, N, C, H, W] -> [B*N, C, H, W] for padding
+    frames_reshaped = frames.view(B * N, C, H_orig, W_orig)
+
     # pad: (left, right, top, bottom)
-    frames_padded = torch.nn.functional.pad(
-        frames,
+    frames_padded_4d = torch.nn.functional.pad(
+        frames_reshaped,
         (pad_size, pad_size, pad_size, pad_size),
         mode='reflect'
     )
 
-    # Get padded dimensions
-    _, _, _, H_pad, W_pad = frames_padded.shape
+    # Reshape back to [B, N, C, H_pad, W_pad]
+    _, _, H_pad, W_pad = frames_padded_4d.shape
+    frames_padded = frames_padded_4d.view(B, N, C, H_pad, W_pad)
 
     # Compute tile coordinates on padded image
     tiles = compute_tiles(H_pad, W_pad, tile_size, overlap)
