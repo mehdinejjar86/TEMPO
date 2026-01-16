@@ -690,12 +690,25 @@ class MixedTrainer:
         checkpoint = torch.load(path, map_location=self.device)
 
         state_dict = checkpoint['model_state']
+
+        # Handle DDP module. prefix
         if self.is_distributed:
             if not any(key.startswith('module.') for key in state_dict.keys()):
                 state_dict = {'module.' + k: v for k, v in state_dict.items()}
         else:
             if any(key.startswith('module.') for key in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # Handle torch.compile _orig_mod. prefix
+        model_is_compiled = any(k.startswith('_orig_mod.') for k in self.model.state_dict().keys())
+        checkpoint_is_compiled = any(k.startswith('_orig_mod.') for k in state_dict.keys())
+
+        if model_is_compiled and not checkpoint_is_compiled:
+            # Model compiled but checkpoint is not - add prefix
+            state_dict = {'_orig_mod.' + k: v for k, v in state_dict.items()}
+        elif not model_is_compiled and checkpoint_is_compiled:
+            # Checkpoint compiled but model is not - remove prefix
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
         self.model.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
