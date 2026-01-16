@@ -222,7 +222,8 @@ def infer_with_tiling(
         pred_tile, _ = model(frames_tile, anchor_times, target_time)
 
         # Store prediction (remove batch dimension)
-        tile_preds.append(pred_tile[0])  # [3, tile_size, tile_size]
+        # Clone to prevent CUDA graphs from overwriting the tensor on next iteration
+        tile_preds.append(pred_tile[0].clone())  # [3, tile_size, tile_size]
 
     # Stitch tiles back to full resolution (padded size)
     pred_padded = stitch_tiles(tile_preds, tiles, H_pad, W_pad, overlap)
