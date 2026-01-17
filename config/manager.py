@@ -106,10 +106,10 @@ class RunManager:
         model_state = model.module.state_dict() if is_distributed else model.state_dict()
 
         checkpoint = {
-            'model_state': model_state,
+            "model_state": model.module.state_dict() if is_distributed else model.state_dict(),
             'step': step,
             'epoch': epoch,
-            'model_state': model.state_dict(),
+            # 'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
             'scheduler_state': scheduler.state_dict() if scheduler else None,
             'best_metric': best_metric,

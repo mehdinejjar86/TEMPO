@@ -19,12 +19,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
-from torch.amp import autocast, GradScaler, autocast_mode
+# from torch.amp import autocast, GradScaler, autocast_mode
+from torch.amp import autocast, autocast_mode
+from torch.cuda.amp import GradScaler
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import os
+import torch._dynamo
+
+# Avoid DDPOptimizer path that fails with higher-order ops
+torch._dynamo.config.optimize_ddp = False
 
 # Optional but recommended
 try:
@@ -79,9 +85,10 @@ class MixedTrainer:
             else torch.float16 if config.amp_dtype.lower() == "fp16"
             else torch.float32
         )
-        self.use_autocast = (
-            config.use_amp and autocast_mode.is_autocast_available(self.amp_device_type)
-        )
+        # self.use_autocast = (
+        #     config.use_amp and autocast_mode.is_autocast_available(self.amp_device_type)
+        # )
+        self.use_autocast = config.use_amp  # FIXED: is_autocast_available doesn't exist in PyTorch 2.1
 
         # Scaler only for CUDA + fp16
         if self.use_autocast and self.amp_device_type == "cuda" and self.amp_dtype == torch.float16:
@@ -110,18 +117,32 @@ class MixedTrainer:
             use_cross_scale=config.use_cross_scale,
             use_checkpointing=config.use_checkpointing,
         ).to(self.device)
-
-        # Wrap for DDP
+        if config.compile_model and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model, mode="max-autotune", fullgraph=True)
+        # Wrap DDP (only once)
         if self.is_distributed:
             self.model = DDP(self.model, device_ids=[self.device.index], find_unused_parameters=True)
 
-        if config.compile_model and hasattr(torch, 'compile'):
-            print("  ⚡ Compiling model with PyTorch 2.0 (max-autotune)...")
-            self.model = torch.compile(
-                self.model,
-                mode="max-autotune",  # Try all CUDA kernels, pick fastest
-                fullgraph=True,       # Compile entire forward pass
-            )
+        # # Resume BEFORE compile
+        # if config.resume:
+        #     self._load_checkpoint(config.resume)
+
+        # # Wrap for DDP
+        # if self.is_distributed:
+        #     self.model = DDP(self.model, device_ids=[self.device.index], find_unused_parameters=True)
+        # # Compile FIRST
+        # if config.compile_model and hasattr(torch, "compile"):
+        #     self.model = torch.compile(self.model, mode="max-autotune", fullgraph=True)
+        ## Then wrap in DDP
+        # if self.is_distributed:
+        #     self.model = DDP(self.model, device_ids=[self.device.index], find_unused_parameters=True)
+        # if config.compile_model and hasattr(torch, 'compile'):
+        #     print("  ⚡ Compiling model with PyTorch 2.0 (max-autotune)...")
+        #     self.model = torch.compile(
+        #         self.model,
+        #         mode="max-autotune",  # Try all CUDA kernels, pick fastest
+        #         fullgraph=True,       # Compile entire forward pass
+        #     )
 
         # Loss
         self.loss_fn = build_tempo_loss(config.loss_config).to(self.device)
@@ -193,26 +214,30 @@ class MixedTrainer:
         train_dataset = ConcatDataset([vimeo_train, x4k_train])
 
         dataset_sizes = [len(vimeo_train), len(x4k_train)]
-
+        
         # Calculate optimal ratio for full dataset coverage if requested
         requested_ratio = self.x4k_config['vimeo_ratio']
         if requested_ratio < 0:  # Use -1 to trigger auto calculation
-            # Calculate batch counts
-            vimeo_batches = len(vimeo_train) // self.config.batch_size
-            x4k_batches = len(x4k_train) // self.config.batch_size
+            # Calculate batch counts (account for DDP)
+            effective_batch_size = self.config.batch_size
+            if self.is_distributed:
+                effective_batch_size *= dist.get_world_size()
+            
+            vimeo_batches = len(vimeo_train) // effective_batch_size
+            x4k_batches = len(x4k_train) // effective_batch_size
             total_batches = vimeo_batches + x4k_batches
-
+        
             # Set ratio proportional to dataset sizes
             vimeo_ratio = vimeo_batches / total_batches
             x4k_ratio = x4k_batches / total_batches
-
+        
             print(f"  Vimeo: {len(vimeo_train):,} samples (N=2) → {vimeo_batches:,} batches")
             print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']}) → {x4k_batches:,} batches")
             print(f"  Auto ratio: {vimeo_ratio:.3f} Vimeo / {x4k_ratio:.3f} X4K (uses ALL samples per epoch)")
         else:
             vimeo_ratio = requested_ratio
             x4k_ratio = 1.0 - vimeo_ratio
-
+        
             print(f"  Vimeo: {len(vimeo_train):,} samples (N=2)")
             print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']})")
             print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {x4k_ratio:.0%} X4K (may skip samples)")
@@ -275,16 +300,16 @@ class MixedTrainer:
             n_frames=4,
         )
 
-        x4k_sampler = DistributedSampler(x4k_test, shuffle=False) if self.is_distributed else None
-
+        # x4k_sampler = DistributedSampler(x4k_test, shuffle=False) if self.is_distributed else None
+        x4k_sampler = None  # rank0 evaluates FULL X4K set
         self.x4k_test_loader = DataLoader(
             x4k_test,
             batch_size=1,  # Process one 4K image at a time (for tiled inference)
             shuffle=False,
-            num_workers=4,
+            num_workers=2,
             sampler=x4k_sampler,
             collate_fn=x4k_test_collate,
-            pin_memory=True
+            pin_memory=False
         )
 
         print(f"  X4K Test: {len(x4k_test):,} samples (N=4, STEP=1)")
@@ -456,7 +481,14 @@ class MixedTrainer:
             if self.global_step % self.config.val_interval == 0 and self.global_step > 0:
                 if self.is_distributed:
                     dist.barrier()
-
+                # if self.is_main_process and self.run_manager:
+                #     self.run_manager.save_checkpoint(
+                #         self.model, self.optimizer, self.lr_scheduler,
+                #         self.global_step, self.epoch, self.best_psnr,
+                #         is_best=False,
+                #         is_main_process=self.is_main_process,
+                #         is_distributed=self.is_distributed,
+                #     )
                 # Validate on both datasets
                 vimeo_metrics = self.validate_vimeo()
                 x4k_metrics = self.validate_x4k()
@@ -537,7 +569,7 @@ class MixedTrainer:
             total_psnr += psnr.item() * frames.size(0)
             num_samples += frames.size(0)
 
-            self.ssim_metric.update(pred, target)
+            # self.ssim_metric.update(pred, target)
             batch_ssim = self.ssim_metric(pred, target).item()
             total_ssim_sum += batch_ssim * frames.size(0)
 
@@ -572,7 +604,7 @@ class MixedTrainer:
             num_samples = int(local_results[2].item())
 
         avg_psnr = total_psnr / max(1, num_samples)
-        avg_ssim = self.ssim_metric.compute().item()
+        avg_ssim = total_ssim_sum / max(1, num_samples)
 
         if self.is_main_process:
             print(f"\n  📈 Vimeo Validation: PSNR={avg_psnr:.2f} dB, SSIM={avg_ssim:.4f}")
@@ -583,144 +615,175 @@ class MixedTrainer:
     def validate_x4k(self) -> Dict[str, float]:
         """
         Validate on X4K test dataset (N=4, 4K resolution with tiling).
-
+    
         Process:
         1. Tile-based inference: 512×512 tiles with 64px overlap
         2. Stitch tiles back to full 4K resolution with weighted blending
         3. Compute PSNR/SSIM on FULL STITCHED 4K image (not crops)
         4. Save 512×512 center crops as preview samples (visualization only)
         """
+        metrics = torch.zeros(2, device=self.device)  # [psnr, ssim]
+    
+        # IMPORTANT: non-main ranks do NOTHING heavy
+        if self.is_distributed and not self.is_main_process:
+            dist.broadcast(metrics, src=0)
+            return {"psnr": metrics[0].item(), "ssim": metrics[1].item()}
+    
+        # ---- rank0 only below ----
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+    
         self.model.eval()
         self.ssim_metric.reset()
-
+    
         total_psnr = 0.0
         total_ssim_sum = 0.0
         num_samples = 0
-
+    
         model_to_eval = self.model.module if self.is_distributed else self.model
-
+    
         iterable = self.x4k_test_loader
         pbar = None
         if self.is_main_process:
             pbar = tqdm(self.x4k_test_loader, desc="Validating X4K", unit="sample",
-                       ncols=120, leave=False, colour="blue")
+                        ncols=120, leave=False, colour="blue")
             iterable = pbar
-
-        # Compute sample indices for saving
+    
         num_val_batches = len(self.x4k_test_loader)
-        sample_indices = np.linspace(0, num_val_batches - 1,
-                                    min(self.config.n_val_samples, num_val_batches),
-                                    dtype=int)
-
+        sample_indices = np.linspace(
+            0, num_val_batches - 1,
+            min(self.config.n_val_samples, num_val_batches),
+            dtype=int
+        )
+    
         for idx, (frames, anchor_times, target_time, target) in enumerate(iterable):
             frames = frames.to(self.device, non_blocking=True)
             anchor_times = anchor_times.to(self.device, non_blocking=True)
             target_time = target_time.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-
-            # ===== STEP 1: Tiled inference + stitching =====
-            # Processes 4K image in 512×512 tiles, stitches back to full resolution
-            pred_full = infer_with_tiling(
-                model_to_eval, frames, anchor_times, target_time,
-                tile_size=512, overlap=64
-            )
+    
+            if self.use_autocast:
+                with autocast(self.amp_device_type, dtype=self.amp_dtype):
+                    pred_full = infer_with_tiling(
+                        model_to_eval, frames, anchor_times, target_time,
+                        tile_size=448, overlap=64
+                    )
+            else:
+                pred_full = infer_with_tiling(
+                    model_to_eval, frames, anchor_times, target_time,
+                    tile_size=448, overlap=64
+                )
+    
             pred_full = pred_full.clamp(0, 1)
-
-            # ===== STEP 2: Compute metrics on FULL STITCHED 4K image =====
+    
             mse = F.mse_loss(pred_full, target)
             psnr = -10 * torch.log10(mse + 1e-8)
             total_psnr += psnr.item()
             num_samples += 1
-
-            # SSIM also computed on full 4K resolution
-            self.ssim_metric.update(pred_full, target)
+    
             batch_ssim = self.ssim_metric(pred_full, target).item()
             total_ssim_sum += batch_ssim
-
-            # ===== STEP 3: Save center crop samples (512×512) for visualization =====
-            # Note: Metrics are computed on FULL 4K, but we save crops for easier inspection
+    
             if idx in sample_indices and self.is_main_process and self.run_manager:
                 _, _, H, W = pred_full.shape
                 crop_size = 512
-
-                # Center crop all frames for visualization
                 cy, cx = H // 2, W // 2
                 y1, y2 = cy - crop_size // 2, cy + crop_size // 2
                 x1, x2 = cx - crop_size // 2, cx + crop_size // 2
-
+    
                 viz_dict = {
                     'frame0': frames[0, 0, :, y1:y2, x1:x2],
                     'frame1': frames[0, -1, :, y1:y2, x1:x2],
                     'target': target[0, :, y1:y2, x1:x2],
                     'pred': pred_full[0, :, y1:y2, x1:x2],
                     'error': (pred_full[0, :, y1:y2, x1:x2] - target[0, :, y1:y2, x1:x2]).abs().mean(0, True).repeat(3,1,1),
-                    'conf': torch.zeros(3, crop_size, crop_size, device=self.device)  # Placeholder
+                    'conf': torch.zeros(3, crop_size, crop_size, device=self.device)
                 }
-
+    
                 save_path = self.run_manager.sample_dir / f"x4k_epoch_{self.epoch:03d}_sample_{idx:03d}.png"
                 self._save_image_grid(viz_dict, save_path)
                 self.run_manager.log_images(viz_dict, self.global_step, "val/x4k")
-
+    
             if self.is_main_process and pbar is not None:
                 pbar.set_postfix({
                     'psnr': f"{psnr.item():.2f}",
                     'ssim': f"{batch_ssim:.4f}",
                     'avg_psnr': f"{total_psnr/num_samples:.2f}"
                 })
-
-        # Aggregate across GPUs
-        if self.is_distributed:
-            local_results = torch.tensor([total_psnr, total_ssim_sum, float(num_samples)],
-                                        dtype=torch.float64, device=self.device)
-            dist.all_reduce(local_results, op=dist.ReduceOp.SUM)
-            total_psnr = local_results[0].item()
-            total_ssim_sum = local_results[1].item()
-            num_samples = int(local_results[2].item())
-
+    
         avg_psnr = total_psnr / max(1, num_samples)
-        avg_ssim = self.ssim_metric.compute().item()
-
+        avg_ssim = total_ssim_sum / max(1, num_samples)
+    
         if self.is_main_process:
             print(f"\n  📈 X4K Validation: PSNR={avg_psnr:.2f} dB, SSIM={avg_ssim:.4f}")
-
-        return {'psnr': avg_psnr, 'ssim': avg_ssim}
+    
+        # broadcast the REAL metrics to all ranks
+        metrics = torch.tensor([avg_psnr, avg_ssim], device=self.device)
+        if self.is_distributed:
+            dist.broadcast(metrics, src=0)
+    
+        return {"psnr": metrics[0].item(), "ssim": metrics[1].item()}
 
     def _load_checkpoint(self, path: str):
         print(f"📂 Loading checkpoint: {path}")
         checkpoint = torch.load(path, map_location=self.device)
+        sd = checkpoint["model_state"]
+    
+        model_keys = self.model.state_dict().keys()
+        ckpt_keys  = sd.keys()
+    
+        model_has_orig = any("_orig_mod" in k for k in model_keys)
+        ckpt_has_orig  = any("_orig_mod" in k for k in ckpt_keys)
+    
+        # If model expects _orig_mod but checkpoint doesn't, add it
+        if model_has_orig and not ckpt_has_orig:
+            def add_orig(k: str) -> str:
+                if k.startswith("module."):
+                    return "module._orig_mod." + k[len("module."):]
+                return "_orig_mod." + k
+            sd = {add_orig(k): v for k, v in sd.items()}
+    
+        # If checkpoint has _orig_mod but model doesn't, strip it
+        if ckpt_has_orig and not model_has_orig:
+            def strip_orig(k: str) -> str:
+                k = k.replace("module._orig_mod.", "module.")
+                k = k.replace("_orig_mod.", "")
+                return k
+            sd = {strip_orig(k): v for k, v in sd.items()}
+    
+        # Now match DDP prefix
+        model_wants_module = any(k.startswith("module.") for k in model_keys)
+        ckpt_has_module = any(k.startswith("module.") for k in sd.keys())
+    
+        if model_wants_module and not ckpt_has_module:
+            sd = {"module." + k: v for k, v in sd.items()}
+        elif (not model_wants_module) and ckpt_has_module:
+            sd = {k[len("module."):]: v for k, v in sd.items()}
+    
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        print(f"✅ Loaded with strict=False. Missing={len(missing)} Unexpected={len(unexpected)}")
+    
+        # Optimizer/scheduler (optional)
+        if "optimizer_state" in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            except Exception as e:
+                print(f"⚠️ Optimizer state not loaded: {e}")
+    
+        if checkpoint.get("scheduler_state") and self.lr_scheduler:
+            try:
+                self.lr_scheduler.load_state_dict(checkpoint["scheduler_state"])
+            except Exception as e:
+                print(f"⚠️ Scheduler state not loaded: {e}")
+    
+        self.global_step = checkpoint.get("step", 0)
+        self.epoch = checkpoint.get("epoch", 0)
+        self.best_psnr = checkpoint.get("best_metric", 0.0)
+        print(f"✅ Resumed from step {self.global_step}, epoch {self.epoch}")
+    
 
-        state_dict = checkpoint['model_state']
-
-        # Handle DDP module. prefix
-        if self.is_distributed:
-            if not any(key.startswith('module.') for key in state_dict.keys()):
-                state_dict = {'module.' + k: v for k, v in state_dict.items()}
-        else:
-            if any(key.startswith('module.') for key in state_dict.keys()):
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-        # Handle torch.compile _orig_mod. prefix
-        model_is_compiled = any(k.startswith('_orig_mod.') for k in self.model.state_dict().keys())
-        checkpoint_is_compiled = any(k.startswith('_orig_mod.') for k in state_dict.keys())
-
-        if model_is_compiled and not checkpoint_is_compiled:
-            # Model compiled but checkpoint is not - add prefix
-            state_dict = {'_orig_mod.' + k: v for k, v in state_dict.items()}
-        elif not model_is_compiled and checkpoint_is_compiled:
-            # Checkpoint compiled but model is not - remove prefix
-            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-
-        self.model.load_state_dict(state_dict)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-
-        if checkpoint.get('scheduler_state') and self.lr_scheduler:
-            self.lr_scheduler.load_state_dict(checkpoint['scheduler_state'])
-
-        self.global_step = checkpoint.get('step', 0)
-        self.epoch = checkpoint.get('epoch', 0)
-        self.best_psnr = checkpoint.get('best_metric', 0)
-
-        print(f"  Resumed from step {self.global_step}, epoch {self.epoch}")
 
     def train(self):
         if self.is_main_process:
@@ -848,15 +911,13 @@ def main():
     parser.add_argument("--amp", action="store_true", dest='use_amp')
     parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"])
 
+    # Logging
+    parser.add_argument("--use_wandb", action="store_true")
     # Loss configuration
     parser.add_argument("--loss_preset", type=str, choices=["psnr", "balanced", "ssim"],
                        default="psnr",
                        help="Loss configuration preset: 'psnr' (default, max PSNR), "
                             "'balanced' (balance PSNR+SSIM), 'ssim' (prioritize SSIM)")
-
-    # Logging
-    parser.add_argument("--use_wandb", action="store_true")
-
     # Distributed
     parser.add_argument("--distributed", action="store_true")
 
@@ -889,7 +950,6 @@ def main():
 
     # Apply overrides to default config
     config = replace(default_config, **overrides)
-
     # Apply loss configuration preset
     if args.loss_preset == "balanced":
         from config.loss_balanced import BALANCED_LOSS_CONFIG
@@ -902,7 +962,6 @@ def main():
     else:
         # Default PSNR-optimized (no config override needed)
         print(f"🎯 Using PSNR-OPTIMIZED loss configuration (default)")
-
     # Build X4K config dict
     x4k_config = {
         'root': args.x4k_root,

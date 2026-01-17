@@ -5,3 +5,10 @@ runs/*
 .vscode/*
 .ipynb_checkpoints
 .claude
+# Logs
+*.log
+logs/
+err_logs/
+
+# Datasets / large artifacts
+datasets_*/
