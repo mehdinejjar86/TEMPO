@@ -8,36 +8,39 @@
 #SBATCH --time=336:00:00
 #SBATCH --job-name inffft
 
+#!/bin/bash
+# run_tempo_eval.sh - Evaluate TEMPO on confocal data
+
+# Set paths (modify these for your setup)
+CHECKPOINT_PATH="/home/groups/ChangLab/govindsa/confocal_project/TEMPO/code/TEMPO/checkpoint_step_685000.pth"
+DATA_PATH="/home/groups/ChangLab/govindsa/confocal_project/TEMPO/code/TEMPO/datasets_atlas_specimen_ch0_ch1_80_20_split/vimeo_triplet"
+
+# Model architecture (should match your training config)
+BASE_CHANNELS=64
+TEMPORAL_CHANNELS=64
+ENCODER_DEPTHS="3 3 12 3"
+DECODER_DEPTHS="3 3 3 3"
+
+echo "=== TEMPO Confocal Evaluation ==="
+echo "Checkpoint: $CHECKPOINT_PATH"
+echo "Data: $DATA_PATH"
+echo "=================================="
+
 # Activate conda environment
-# source /home/groups/ChangLab/govindsa/miniconda3/bin/activate vfi_env
+source /home/groups/ChangLab/govindsa/miniconda3/etc/profile.d/conda.sh
+conda activate vfi_env
 
+# Run evaluation
+cd /home/groups/ChangLab/govindsa/confocal_project/TEMPO/code/TEMPO
 
-# inputs=(
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/input/AMTEC_001_ON_HRD_RS_2_ch0_resized"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/input/AMTEC_001_ON_HRD_RS_2_ch1_resized"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/input/AMTEC_001_ON_HRD_RS_2_ch2_resized"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/input/AMTEC_001_ON_HRD_RS_2_ch3_resized"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/input/AMTEC_001_ON_HRD_RS_2_ch4_resized"
-# )
+python tempo_inference.py \
+  --model_path "$CHECKPOINT_PATH" \
+  --data_path "$DATA_PATH" \
+  --device cuda \
+  --base_channels $BASE_CHANNELS \
+  --temporal_channels $TEMPORAL_CHANNELS \
+  --encoder_depths $ENCODER_DEPTHS \
+  --decoder_depths $DECODER_DEPTHS \
+  --use_cross_scale
 
-# outputs=(
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/output/AMTEC_001_ON_HRD_RS_2_ch0_resized_STEP3_Fusion"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/output/AMTEC_001_ON_HRD_RS_2_ch1_resized_STEP3_Fusion"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/output/AMTEC_001_ON_HRD_RS_2_ch2_resized_STEP3_Fusion"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/output/AMTEC_001_ON_HRD_RS_2_ch3_resized_STEP3_Fusion"
-# "/home/exacloud/gscratch/ChangLab/govindsa/confocal_project/dataset/gordonImages/output/AMTEC_001_ON_HRD_RS_2_ch4_resized_STEP3_Fusion"
-# )
-
-# MODEL_PATH="/home/groups/ChangLab/govindsa/confocal_project/fusionfft/runs/2025-10-05-12-46-36/checkpoints/best_val_model.pth"
-# for i in "${!inputs[@]}"; do
-#     echo "Processing ${inputs[$i]}"
-#     python /home/groups/ChangLab/govindsa/confocal_project/fusionfft/fusion_inference.py \
-#     --model_path "$MODEL_PATH" \
-#     --input_dir "${inputs[$i]}" \
-#     --output_dir "${outputs[$i]}" \
-#     --step 2 
-#     echo "Completed ${inputs[$i]}"
-# done
-# echo "All jobs completed successfully!"
-
-python tempo_inference.py 
+echo "=== Evaluation Complete ==="

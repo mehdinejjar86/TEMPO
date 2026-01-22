@@ -1,169 +1,174 @@
-
-import torch
-from torch.utils.data import DataLoader
-from model.tempo import build_tempo
-from data.data_vimeo_triplet import Vimeo90KTriplet, vimeo_collate
+# confocal_tempo_eval.py
 import cv2
+import math
+import sys
+import torch
 import numpy as np
-from pathlib import Path
-from tqdm import tqdm
+import argparse
+import os
+import warnings
+warnings.filterwarnings('ignore')
+torch.set_grad_enabled(False)
 
-def run_tempo_inference(
-    data_root,
-    model_checkpoint,
-    output_dir,
-    device='cuda'
-):
-    """
-    Run TEMPO inference on your CHC data using the pretrained Vimeo model.
+sys.path.append('.')
+from model.tempo import build_tempo
+VFIMAMBA_ROOT = "/home/groups/ChangLab/govindsa/confocal_project/datasets/benchmarking/VFIMamba"
+sys.path.insert(0, VFIMAMBA_ROOT)
+from benchmark.utils.pytorch_msssim import ssim_matlab
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_path', type=str, required=True,
+                   help='Path to TEMPO checkpoint file')
+parser.add_argument('--data_path', type=str, required=True,
+                   help='Path to confocal dataset (should contain tri_testlist.txt and sequences/)')
+parser.add_argument('--device', type=str, default='cuda',
+                   help='Device to run on (cuda/cpu)')
+
+# Model architecture arguments (should match your training config)
+parser.add_argument('--base_channels', type=int, default=64)
+parser.add_argument('--temporal_channels', type=int, default=64)
+parser.add_argument('--encoder_depths', type=int, nargs='+', default=[3, 3, 12, 3])
+parser.add_argument('--decoder_depths', type=int, nargs='+', default=[3, 3, 3, 3])
+parser.add_argument('--num_heads', type=int, default=8)
+parser.add_argument('--num_points', type=int, default=4)
+parser.add_argument('--use_cross_scale', action='store_true', default=True)
+
+args = parser.parse_args()
+
+# Build model with same architecture as training
+print("🏗️ Building TEMPO model...")
+model = build_tempo(
+    base_channels=args.base_channels,
+    temporal_channels=args.temporal_channels,
+    encoder_depths=args.encoder_depths,
+    decoder_depths=args.decoder_depths,
+    num_heads=args.num_heads,
+    num_points=args.num_points,
+    use_cross_scale=args.use_cross_scale,
+    use_checkpointing=False,  # Disable for inference
+).to(args.device)
+
+# Load checkpoint
+print(f"📂 Loading checkpoint: {args.model_path}")
+checkpoint = torch.load(args.model_path, map_location=args.device)
+
+# Handle different checkpoint formats and DDP/compile prefixes
+state_dict = checkpoint.get("model_state", checkpoint)
+
+# Remove DDP wrapper prefixes if present
+if any(k.startswith("module.") for k in state_dict.keys()):
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+# Remove torch.compile prefixes if present  
+if any("_orig_mod" in k for k in state_dict.keys()):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("_orig_mod.", "")
+        new_state_dict[new_k] = v
+    state_dict = new_state_dict
+
+missing, unexpected = model.load_state_dict(state_dict, strict=False)
+if missing:
+    print(f"⚠️  Missing keys: {missing}")
+if unexpected:
+    print(f"⚠️  Unexpected keys: {unexpected}")
+
+model.eval()
+print(f"✅ Model loaded successfully")
+
+# Print model info
+total_params = sum(p.numel() for p in model.parameters()) / 1e6
+print(f"📊 Model: {total_params:.2f}M parameters")
+
+print(f'=========================Starting testing=========================')
+print(f'Dataset: Confocal TEMPO   Device: {args.device}')
+
+# Load dataset
+path = args.data_path
+tri_testlist = os.path.join(path, 'tri_testlist.txt')
+
+if not os.path.exists(tri_testlist):
+    raise FileNotFoundError(f"tri_testlist.txt not found at {tri_testlist}")
+
+with open(tri_testlist, 'r') as f:
+    test_sequences = [line.strip() for line in f if line.strip()]
+
+psnr_list, ssim_list = [], []
+
+print(f"Found {len(test_sequences)} test sequences")
+
+for seq_name in test_sequences:
+    if len(seq_name) <= 1:
+        continue
+        
+    # Load images (same structure as Vimeo90K)
+    im1_path = os.path.join(path, 'sequences', seq_name, 'im1.png')
+    im2_path = os.path.join(path, 'sequences', seq_name, 'im2.png') 
+    im3_path = os.path.join(path, 'sequences', seq_name, 'im3.png')
     
-    Args:
-        data_root: Path to your tempo_format dataset (created by previous script)
-        model_checkpoint: Path to pretrained TEMPO model
-        output_dir: Where to save interpolated frames
-        device: 'cuda' or 'cpu'
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    # Check if files exist
+    if not all(os.path.exists(p) for p in [im1_path, im2_path, im3_path]):
+        print(f"Skipping {seq_name} - missing files")
+        continue
     
-    print("="*60)
-    print("TEMPO Inference on CHC Data")
-    print("="*60)
+    # Load images
+    I0 = cv2.imread(im1_path)  # First frame
+    I1 = cv2.imread(im2_path)  # Ground truth (middle)
+    I2 = cv2.imread(im3_path)  # Last frame
     
-    # Load dataset using existing Vimeo90K loader
-    print(f"\n📂 Loading dataset from: {data_root}")
-    dataset = Vimeo90KTriplet(
-        root=data_root,
-        split="test",
-        mode="interp",
-        crop_size=None,  # Full resolution (512x512)
-        center_crop_eval=False
-    )
+    if I0 is None or I1 is None or I2 is None:
+        print(f"Skipping {seq_name} - failed to load images")
+        continue
     
-    dataloader = DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=vimeo_collate
-    )
+    # Convert to tensors [1, 2, 3, H, W] for TEMPO (N=2 frames)
+    frames = torch.stack([
+        torch.tensor(I0.transpose(2, 0, 1)).float() / 255.0,  # im1
+        torch.tensor(I2.transpose(2, 0, 1)).float() / 255.0,  # im3
+    ], dim=0).unsqueeze(0).to(args.device)  # [1, 2, 3, H, W]
     
-    print(f"   Found {len(dataset)} triplets to process")
+    # Anchor times for interpolation: [0.0, 1.0] (start and end)
+    anchor_times = torch.tensor([[0.0, 1.0]]).to(args.device)  # [1, 2]
     
-    # Load pretrained model
-    print(f"\n🤖 Loading pretrained TEMPO model from: {model_checkpoint}")
-    model = build_tempo(base_channels=64, temporal_channels=64)
+    # Target time: 0.5 (middle frame)
+    target_time = torch.tensor([0.5]).to(args.device)  # [1]
     
-    checkpoint = torch.load(model_checkpoint, map_location=device)
-    state_dict = checkpoint.get('model_state', checkpoint)
-    
-    # Handle DDP checkpoint (remove 'module.' prefix)
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    
-    model.load_state_dict(state_dict)
-    model = model.to(device)
-    model.eval()
-    print("   ✅ Model loaded successfully!")
-    
-    # Run inference
-    print(f"\n🚀 Running inference...")
-    print(f"   Output directory: {output_dir}")
-    
-    results = []
-    
+    # Run TEMPO inference
     with torch.no_grad():
-        for idx, (frames, anchor_times, target_time, target) in enumerate(tqdm(dataloader, desc="Processing")):
-            # Move to device
-            frames = frames.to(device)
-            anchor_times = anchor_times.to(device)
-            target_time = target_time.to(device)
-            target = target.to(device)
-            
-            # Generate interpolated frame
-            output, aux = model(frames, anchor_times, target_time)
-            
-            # Clamp to [0, 1]
-            output = output.clamp(0, 1)
-            
-            # Calculate metrics (PSNR, SSIM)
-            mse = torch.nn.functional.mse_loss(output, target)
-            psnr = -10 * torch.log10(mse + 1e-8)
-            
-            # Save interpolated frame
-            output_img = output[0].cpu()  # (3, H, W)
-            
-            # Convert RGB back to grayscale (take mean of channels)
-            grayscale = output_img.mean(dim=0).numpy()  # (H, W)
-            
-            # Scale to uint8 [0, 255]
-            img_uint8 = (grayscale * 255).astype(np.uint8)
-            
-            # Save
-            save_path = output_path / f"interpolated_frame_{idx+1:04d}.png"
-            cv2.imwrite(str(save_path), img_uint8)
-            
-            # Also save ground truth and inputs for comparison
-            if idx == 0:  # Save first triplet for visual inspection
-                comparison_dir = output_path / "comparison"
-                comparison_dir.mkdir(exist_ok=True)
-                
-                # Save input frames
-                frame1 = frames[0, 0].cpu().mean(dim=0).numpy()
-                frame2 = frames[0, 1].cpu().mean(dim=0).numpy()
-                cv2.imwrite(str(comparison_dir / "input_frame1.png"), (frame1 * 255).astype(np.uint8))
-                cv2.imwrite(str(comparison_dir / "input_frame3.png"), (frame2 * 255).astype(np.uint8))
-                
-                # Save ground truth
-                gt = target[0].cpu().mean(dim=0).numpy()
-                cv2.imwrite(str(comparison_dir / "ground_truth_frame2.png"), (gt * 255).astype(np.uint8))
-                
-                # Save interpolated
-                cv2.imwrite(str(comparison_dir / "interpolated_frame2.png"), img_uint8)
-            
-            results.append({
-                'triplet': idx,
-                'psnr': psnr.item(),
-                'confidence': aux['conf_map'].mean().item()
-            })
+        pred, aux = model(frames, anchor_times, target_time)
     
-    # Print summary
-    print(f"\n" + "="*60)
-    print("✅ Inference Complete!")
-    print("="*60)
-    print(f"   Processed: {len(results)} frames")
-    print(f"   Average PSNR: {np.mean([r['psnr'] for r in results]):.2f} dB")
-    print(f"   Output saved to: {output_dir}")
-    print(f"   Comparison samples: {output_dir}/comparison/")
+    # ⚠️ REMOVED CLAMPING - Match VFIMamba evaluation
+    # pred = pred.clamp(0, 1)  # REMOVED THIS LINE
     
-    # Save metrics to CSV
-    import csv
-    metrics_file = output_path / "metrics.csv"
-    with open(metrics_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['triplet', 'psnr', 'confidence'])
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"   Metrics saved to: {metrics_file}")
+    # Convert ground truth to tensor (match VFIMamba format exactly)
+    gt_tensor = torch.tensor(I1.transpose(2, 0, 1)).to(args.device).unsqueeze(0) / 255.0
     
-    return results
+    # Calculate SSIM on unclamped predictions (like VFIMamba)
+    ssim_score = ssim_matlab(gt_tensor, pred.unsqueeze(0) if pred.dim() == 3 else pred).detach().cpu().numpy()
+    
+    # Convert to numpy for PSNR calculation (no clamping)
+    pred_np = pred[0].detach().cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+    gt_np = I1.astype(np.float32) / 255.0  # [H, W, 3]
+    
+    # Calculate PSNR (match VFIMamba - no epsilon added)
+    mse = ((pred_np - gt_np) ** 2).mean()
+    psnr = -10 * math.log10(mse)
+    
+    psnr_list.append(psnr)
+    ssim_list.append(ssim_score)
+    
+    # Print running average (match VFIMamba format)
+    print("Avg PSNR: {} SSIM: {}".format(np.mean(psnr_list), np.mean(ssim_list)))
 
+print("="*50)
+print("FINAL RESULTS:")
+print(f"Total sequences processed: {len(psnr_list)}")
+print(f"Final Average PSNR: {float(np.mean(psnr_list)):.4f} dB")
+print(f"Final Average SSIM: {float(np.mean(ssim_list)):.4f}")
+print("="*50)
 
-if __name__ == "__main__":
-    # Paths
-    data_root = "/home/groups/ChangLab/govindsa/confocal_project/datasets/tempo_format/input/H4_Q3_3_ch0_triplet"
-    #### Trained on vimeo data
-    # model_checkpoint = "/home/groups/ChangLab/govindsa/confocal_project/TEMPO/code/TEMPO/runs/2025_10_25_11_19_08/checkpoints/best_model.pth"
-    #### Trained on Atlas specimen data
-    model_checkpoint = "/home/groups/ChangLab/govindsa/confocal_project/TEMPO/code/TEMPO/runs/training_atlas_specimen_on_channel3_11_09/checkpoints/best_model.pth"
-    #### Trained on Vimeo
-    # output_dir = "/home/groups/ChangLab/govindsa/confocal_project/datasets/tempo_format/output/2025_10_25_11_19_08/H4_Q3_3_ch4_interpolated"
-    output_dir = "/home/groups/ChangLab/govindsa/confocal_project/datasets/tempo_format/output/training_atlas_specimen_on_channel3_11_09/H4_Q3_3_ch0_interpolated"
-    # Run inference
-    results = run_tempo_inference(
-        data_root=data_root,
-        model_checkpoint=model_checkpoint,
-        output_dir=output_dir,
-        device='cuda'
-    )
-    
-    print("\n🎉 Done!")
+# Additional statistics
+if len(psnr_list) > 0:
+    print(f"\nDetailed Statistics:")
+    print(f"PSNR - Min: {np.min(psnr_list):.3f}, Max: {np.max(psnr_list):.3f}, Std: {np.std(psnr_list):.3f}")
+    print(f"SSIM - Min: {np.min(ssim_list):.4f}, Max: {np.max(ssim_list):.4f}, Std: {np.std(ssim_list):.4f}")
