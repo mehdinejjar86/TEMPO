@@ -77,7 +77,15 @@ def build_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Build model with default config
-    model = build_tempo().to(device)
+    model = build_tempo(
+        base_channels=64,
+        temporal_channels=64,
+        encoder_depths=[3, 3, 12, 3],
+        decoder_depths=[3, 3, 3, 3],
+        num_heads=8,
+        num_points=4,
+        use_cross_scale=True,
+    ).to(device)
 
     # Handle state dict prefixes (DDP module., torch.compile _orig_mod.)
     state_dict = checkpoint['model_state']
@@ -104,28 +112,41 @@ def get_anchor_indices(target_frame: int, n_frames: int = 4) -> List[int]:
     """
     Get anchor frame indices for a target frame.
 
-    For target t (even), anchors are surrounding odd frames: t-3, t-1, t+1, t+3
-    Handles boundary conditions by clamping to valid range [1, 99].
+    For target t (even), selects 4 consecutive odd frames that surround t.
+    Uses a sliding window approach to handle boundaries properly.
 
     Args:
         target_frame: Target frame index (even, 2-98)
         n_frames: Number of anchor frames (default: 4)
 
     Returns:
-        List of anchor frame indices (odd frames)
-    """
-    # Standard offsets for N=4: -3, -1, +1, +3 from target
-    offsets = [-3, -1, 1, 3]
+        List of 4 distinct anchor frame indices (odd frames)
 
-    anchors = []
-    for offset in offsets:
-        anchor = target_frame + offset
-        # Clamp to valid odd frame range [1, 99]
-        anchor = max(1, min(99, anchor))
-        # Ensure it's odd (in case of boundary clamping)
-        if anchor % 2 == 0:
-            anchor = anchor - 1 if anchor > 1 else anchor + 1
-        anchors.append(anchor)
+    Examples:
+        target=2  -> anchors=[1, 3, 5, 7]   (shifted right, target at 1/6)
+        target=4  -> anchors=[1, 3, 5, 7]   (shifted right, target at 3/6)
+        target=50 -> anchors=[47, 49, 51, 53] (centered, target at 3/6)
+        target=96 -> anchors=[93, 95, 97, 99] (shifted left, target at 3/6)
+        target=98 -> anchors=[93, 95, 97, 99] (shifted left, target at 5/6)
+    """
+    # All odd frames available: 1, 3, 5, ..., 99
+    # For N=4, we need 4 consecutive odd frames spanning 6 frame indices
+    # (e.g., [1,3,5,7] spans indices 1-7)
+
+    # Ideal center position: target should be between anchor[1] and anchor[2]
+    # So first anchor ideally at target - 3
+    ideal_first = target_frame - 3
+
+    # Clamp to valid range: first anchor in [1, 93] to fit 4 odd frames
+    # (93, 95, 97, 99 is the last valid window)
+    first_anchor = max(1, min(93, ideal_first))
+
+    # Ensure first_anchor is odd
+    if first_anchor % 2 == 0:
+        first_anchor -= 1
+
+    # Generate 4 consecutive odd frames
+    anchors = [first_anchor + 2 * i for i in range(n_frames)]
 
     return anchors
 
