@@ -5,3 +5,5 @@ runs/*
 .vscode/*
 .ipynb_checkpoints
 .claude
+netflix/*
+paper/*

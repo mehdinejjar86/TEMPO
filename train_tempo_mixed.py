@@ -179,50 +179,70 @@ class MixedTrainer:
             aug_flip=False,
         )
 
-        # ===== X4K Training Dataset =====
-        x4k_train = X4K1000Dataset(
-            root=self.x4k_config['root'],
-            split="train",
-            steps=self.x4k_config['steps'],  # Can be single int or list
-            crop_size=self.x4k_config['crop_size'],
-            aug_flip=True,
-            n_frames=4,
-        )
+        # ===== X4K Training Datasets (one per n_frames value) =====
+        n_frames_list = self.x4k_config['n_frames']
+        x4k_datasets = []
+        x4k_info = []
+
+        for n_frames in n_frames_list:
+            x4k_ds = X4K1000Dataset(
+                root=self.x4k_config['root'],
+                split="train",
+                steps=self.x4k_config['steps'],  # Can be single int or list
+                crop_size=self.x4k_config['crop_size'],
+                aug_flip=True,
+                n_frames=n_frames,
+            )
+            x4k_datasets.append(x4k_ds)
+            x4k_info.append((n_frames, len(x4k_ds)))
 
         # ===== Concatenate Datasets =====
-        train_dataset = ConcatDataset([vimeo_train, x4k_train])
+        all_datasets = [vimeo_train] + x4k_datasets
+        train_dataset = ConcatDataset(all_datasets)
 
-        dataset_sizes = [len(vimeo_train), len(x4k_train)]
+        dataset_sizes = [len(vimeo_train)] + [len(ds) for ds in x4k_datasets]
+        total_x4k_samples = sum(len(ds) for ds in x4k_datasets)
 
         # Calculate optimal ratio for full dataset coverage if requested
         requested_ratio = self.x4k_config['vimeo_ratio']
         if requested_ratio < 0:  # Use -1 to trigger auto calculation
             # Calculate batch counts
             vimeo_batches = len(vimeo_train) // self.config.batch_size
-            x4k_batches = len(x4k_train) // self.config.batch_size
-            total_batches = vimeo_batches + x4k_batches
+            x4k_batches_list = [len(ds) // self.config.batch_size for ds in x4k_datasets]
+            total_x4k_batches = sum(x4k_batches_list)
+            total_batches = vimeo_batches + total_x4k_batches
 
             # Set ratio proportional to dataset sizes
             vimeo_ratio = vimeo_batches / total_batches
-            x4k_ratio = x4k_batches / total_batches
+            x4k_ratios = [b / total_batches for b in x4k_batches_list]
 
             print(f"  Vimeo: {len(vimeo_train):,} samples (N=2) → {vimeo_batches:,} batches")
-            print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']}) → {x4k_batches:,} batches")
-            print(f"  Auto ratio: {vimeo_ratio:.3f} Vimeo / {x4k_ratio:.3f} X4K (uses ALL samples per epoch)")
+            for (n_frames, size), batches, ratio in zip(x4k_info, x4k_batches_list, x4k_ratios):
+                print(f"  X4K N={n_frames}: {size:,} samples (STEPs={self.x4k_config['steps']}) → {batches:,} batches ({ratio:.1%})")
+            print(f"  Auto ratio: {vimeo_ratio:.3f} Vimeo / {sum(x4k_ratios):.3f} X4K (uses ALL samples per epoch)")
         else:
             vimeo_ratio = requested_ratio
-            x4k_ratio = 1.0 - vimeo_ratio
+            total_x4k_ratio = 1.0 - vimeo_ratio
+
+            # Split X4K ratio proportionally among n_frames datasets
+            x4k_sizes = [len(ds) for ds in x4k_datasets]
+            total_x4k_size = sum(x4k_sizes)
+            x4k_ratios = [(size / total_x4k_size) * total_x4k_ratio for size in x4k_sizes]
 
             print(f"  Vimeo: {len(vimeo_train):,} samples (N=2)")
-            print(f"  X4K:   {len(x4k_train):,} samples (N=4, STEPs={self.x4k_config['steps']})")
-            print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {x4k_ratio:.0%} X4K (may skip samples)")
+            for (n_frames, size), ratio in zip(x4k_info, x4k_ratios):
+                print(f"  X4K N={n_frames}: {size:,} samples (STEPs={self.x4k_config['steps']}) ({ratio:.1%})")
+            print(f"  Batch ratio: {vimeo_ratio:.0%} Vimeo / {total_x4k_ratio:.0%} X4K (may skip samples)")
+
+        # Final ratios list: [vimeo_ratio, x4k_n2_ratio, x4k_n4_ratio, ...]
+        ratios = [vimeo_ratio] + x4k_ratios
 
         # ===== Pure Batch Sampler =====
         if self.is_distributed:
             self.train_sampler = DistributedPureBatchSampler(
                 dataset_sizes=dataset_sizes,
                 batch_size=self.config.batch_size,
-                ratios=[vimeo_ratio, x4k_ratio],
+                ratios=ratios,
                 num_replicas=dist.get_world_size(),
                 rank=dist.get_rank(),
                 shuffle=True,
@@ -232,7 +252,7 @@ class MixedTrainer:
             self.train_sampler = PureBatchSampler(
                 dataset_sizes=dataset_sizes,
                 batch_size=self.config.batch_size,
-                ratios=[vimeo_ratio, x4k_ratio],
+                ratios=ratios,
                 shuffle=True,
                 drop_last=True,
             )
@@ -466,12 +486,16 @@ class MixedTrainer:
                     vimeo_prefixed = {f"vimeo/{k}": v for k, v in vimeo_metrics.items()}
                     x4k_prefixed = {f"x4k/{k}": v for k, v in x4k_metrics.items()}
 
+                    # Compute average PSNR across both datasets
+                    avg_psnr = (vimeo_metrics.get('psnr', 0) + x4k_metrics.get('psnr', 0)) / 2
+
                     self.run_manager.log_metrics(vimeo_prefixed, self.global_step, "val")
                     self.run_manager.log_metrics(x4k_prefixed, self.global_step, "val")
+                    self.run_manager.log_metrics({'avg_psnr': avg_psnr}, self.global_step, "val")
 
-                    # Update best PSNR (use Vimeo as primary metric)
-                    if vimeo_metrics.get('psnr', 0) > self.best_psnr:
-                        self.best_psnr = vimeo_metrics['psnr']
+                    # Update best PSNR (use average of both datasets)
+                    if avg_psnr > self.best_psnr:
+                        self.best_psnr = avg_psnr
 
                 self.model.train()
 
@@ -746,10 +770,13 @@ class MixedTrainer:
                     dist.barrier()
 
                 if self.is_main_process:
-                    # Determine if best (use Vimeo PSNR as primary)
-                    is_best = vimeo_metrics['psnr'] > self.best_psnr
+                    # Compute average PSNR across both datasets
+                    avg_psnr = (vimeo_metrics['psnr'] + x4k_metrics['psnr']) / 2
+
+                    # Determine if best (use average PSNR of both datasets)
+                    is_best = avg_psnr > self.best_psnr
                     if is_best:
-                        self.best_psnr = vimeo_metrics['psnr']
+                        self.best_psnr = avg_psnr
 
                     # Log to WandB/TensorBoard
                     if self.run_manager:
@@ -757,13 +784,15 @@ class MixedTrainer:
                         x4k_prefixed = {f"x4k/{k}": v for k, v in x4k_metrics.items()}
                         self.run_manager.log_metrics(vimeo_prefixed, self.global_step, "val")
                         self.run_manager.log_metrics(x4k_prefixed, self.global_step, "val")
+                        self.run_manager.log_metrics({'avg_psnr': avg_psnr}, self.global_step, "val")
 
                     print(f"\n📊 Epoch {epoch+1} Summary:")
                     print(f"  Train Loss (Vimeo): {epoch_metrics['vimeo'].get('total', 0):.4f}")
                     print(f"  Train Loss (X4K):   {epoch_metrics['x4k'].get('total', 0):.4f}")
                     print(f"  Val PSNR (Vimeo):   {vimeo_metrics['psnr']:.2f} dB, SSIM: {vimeo_metrics['ssim']:.4f}")
                     print(f"  Val PSNR (X4K):     {x4k_metrics['psnr']:.2f} dB, SSIM: {x4k_metrics['ssim']:.4f}")
-                    print(f"  Best PSNR (Vimeo):  {self.best_psnr:.2f} dB")
+                    print(f"  Val PSNR (Avg):     {avg_psnr:.2f} dB")
+                    print(f"  Best PSNR (Avg):    {self.best_psnr:.2f} dB {'⭐ NEW BEST!' if is_best else ''}")
 
                     if self.run_manager:
                         self.run_manager.save_checkpoint(
@@ -824,6 +853,9 @@ def main():
     parser.add_argument("--x4k_step", type=int, nargs='+', default=[1],
                        help="STEP parameter(s) for X4K. Can be single (e.g., 3) or multiple (e.g., 1 3). "
                             "1=small motion, 2=medium, 3=large. Multiple steps increase motion diversity.")
+    parser.add_argument("--x4k_n_frames", type=int, nargs='+', default=[4],
+                       help="Number of input frames for X4K. Can be single (e.g., 4) or multiple (e.g., 2 4). "
+                            "Multiple values create separate datasets for each n_frames.")
     parser.add_argument("--x4k_crop", type=int, default=512,
                        help="Crop size for X4K (512 or 768)")
     parser.add_argument("--vimeo_ratio", type=float, default=0.5,
@@ -864,7 +896,7 @@ def main():
 
     # Separate X4K-specific args (not part of TrainingConfig)
     x4k_args = {
-        'x4k_root', 'x4k_step', 'x4k_crop', 'vimeo_ratio', 'loss_preset'
+        'x4k_root', 'x4k_step', 'x4k_n_frames', 'x4k_crop', 'vimeo_ratio', 'loss_preset'
     }
 
     # Build override dict from explicitly provided TrainingConfig args
@@ -883,9 +915,9 @@ def main():
 
     # Apply default exp_name and notes if not provided
     if 'exp_name' not in overrides:
-        overrides['exp_name'] = f"mixed_vimeo_x4k_step{args.x4k_step}"
+        overrides['exp_name'] = f"mixed_vimeo_x4k_n{args.x4k_n_frames}_step{args.x4k_step}"
     if 'notes' not in overrides:
-        overrides['notes'] = f"Mixed training: Vimeo (N=2) + X4K (N=4, STEP={args.x4k_step})"
+        overrides['notes'] = f"Mixed training: Vimeo (N=2) + X4K (N={args.x4k_n_frames}, STEP={args.x4k_step})"
 
     # Apply overrides to default config
     config = replace(default_config, **overrides)
@@ -907,6 +939,7 @@ def main():
     x4k_config = {
         'root': args.x4k_root,
         'steps': args.x4k_step,
+        'n_frames': args.x4k_n_frames,
         'crop_size': args.x4k_crop,
         'vimeo_ratio': args.vimeo_ratio,
     }
