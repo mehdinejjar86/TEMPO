@@ -9,6 +9,7 @@ Setup:
 
 Usage:
     python benchmark_xiph.py --checkpoint path/to/checkpoint.pt
+    python benchmark_xiph.py --checkpoint ckpt.pt --save_frames ./output/xiph
 
 Frame arrangement:
     - 100 frames per sequence (001.png to 100.png)
@@ -49,6 +50,12 @@ def load_frame(path: Path) -> torch.Tensor:
     """Load a single frame as [3, H, W] tensor in [0, 1] range."""
     img = Image.open(path).convert("RGB")
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+
+
+def save_frame(tensor: torch.Tensor, path: Path):
+    """Save a [3, H, W] tensor as PNG image."""
+    img = (tensor.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
+    Image.fromarray(img).save(path)
 
 
 def get_frame_path(data_dir: Path, seq_name: str, frame_idx: int) -> Path:
@@ -131,15 +138,24 @@ def benchmark_sequence(
     ssim_metric: SSIM,
     tile_size: int = 512,
     overlap: int = 64,
+    save_dir: Path = None,
 ) -> Dict[str, float]:
     """
     Benchmark a single sequence.
+
+    Args:
+        save_dir: If provided, save predicted frames to this directory
 
     Returns:
         Dict with 'psnr' and 'ssim' metrics
     """
     psnr_values = []
     ssim_values = []
+
+    # Create save directory for this sequence
+    if save_dir is not None:
+        seq_save_dir = save_dir / seq_name
+        seq_save_dir.mkdir(parents=True, exist_ok=True)
 
     # Target frames: 2, 4, 6, ..., 98 (even frames)
     target_frames = list(range(2, 99, 2))  # 2 to 98 inclusive
@@ -197,6 +213,11 @@ def benchmark_sequence(
         ssim_val = ssim_metric(pred.unsqueeze(0), target.unsqueeze(0)).item()
         ssim_values.append(ssim_val)
 
+        # Save predicted frame
+        if save_dir is not None:
+            save_path = seq_save_dir / f"{target_idx:03d}.png"
+            save_frame(pred, save_path)
+
         pbar.set_postfix({'psnr': f'{psnr:.2f}', 'ssim': f'{ssim_val:.4f}'})
 
     return {
@@ -222,6 +243,8 @@ def main():
                         help="Overlap between tiles (default: 64)")
     parser.add_argument("--output", type=str, default=None,
                         help="Path to save results JSON")
+    parser.add_argument("--save_frames", type=str, default=None,
+                        help="Directory to save predicted frames (default: None)")
     parser.add_argument("--sequences", type=str, nargs='+', default=None,
                         help="Specific sequences to benchmark (default: all)")
     args = parser.parse_args()
@@ -249,7 +272,14 @@ def main():
     print(f"Device: {device}")
     print(f"Sequences: {len(sequences)}")
     print(f"Tile size: {args.tile_size}, Overlap: {args.overlap}")
+    if args.save_frames:
+        print(f"Saving frames to: {args.save_frames}")
     print(f"{'='*60}\n")
+
+    # Setup save directory
+    save_dir = Path(args.save_frames) if args.save_frames else None
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     # Load model
     model = build_model(args.checkpoint, device)
@@ -268,7 +298,8 @@ def main():
 
         seq_results = benchmark_sequence(
             model, data_dir, seq_name, device, ssim_metric,
-            tile_size=args.tile_size, overlap=args.overlap
+            tile_size=args.tile_size, overlap=args.overlap,
+            save_dir=save_dir
         )
 
         results[seq_name] = seq_results
